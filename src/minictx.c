@@ -1,21 +1,25 @@
 /*
- * minictx.c —— 只创建/销毁 CUDA 上下文，不做任何 DMA
+ * minictx.c — only creates/destroys CUDA contexts, no DMA at all
  *
- * 用途（reports/195）：
- *   已证明 `_nv017281rm` 每次 cuCtxCreate 都执行一次，并在 sp==1 时
- *   通过 `_nv053912rm(CX=0x8c040, R8=SPEED)` 把 0x8C040 的 SPEED 写成
- *   SPEED=2（2.5GT/s）。补丁把该处改成 SPEED=1（5.0GT/s）。
+ * Purpose (reports/195):
+ *   It has been proven that `_nv017281rm` runs on every cuCtxCreate, and when
+ *   sp==1 it goes through `_nv053912rm(CX=0x8c040, R8=SPEED)` to write
+ *   0x8C040's SPEED as SPEED=2 (2.5GT/s). The patch changes that site to
+ *   SPEED=1 (5.0GT/s).
  *
- *   想验证"补丁后链路能否自己升 Gen2"，就不能用 bwtest2 ——
- *   它建完上下文立刻做几十 MB 的真实 DMA，一旦链路在 RM 已初始化后升速，
- *   极易触发 Xid 79（GPU fallen off the bus）。
+ *   To verify "can the link rise to Gen2 by itself after the patch", bwtest2
+ *   must not be used — it does tens of MB of real DMA right after creating the
+ *   context, and if the link re-speeds after RM has already initialized, that
+ *   easily triggers Xid 79 (GPU fallen off the bus).
  *
- *   本程序只做 cuInit → cuCtxCreate → cuCtxDestroy，
- *   让那个 SPEED 写入发生（这是我们要观察的），但不搬运任何数据。
+ *   This program only does cuInit -> cuCtxCreate -> cuCtxDestroy, letting that
+ *   SPEED write happen (that is exactly what we want to observe) while moving
+ *   no data.
  *
- * 不依赖 CUDA toolkit：dlopen libcuda.so.1，手工取 driver API 入口。
- * 编译：gcc -O2 -o minictx minictx.c -ldl
- * 用法：./minictx [次数]
+ * No CUDA toolkit dependency: dlopen libcuda.so.1 and fetch the driver API
+ * entry points by hand.
+ * Build:  gcc -O2 -o minictx minictx.c -ldl
+ * Usage:  ./minictx [rounds]
  */
 #include <dlfcn.h>
 #include <stdio.h>
@@ -33,7 +37,7 @@ int main(int argc, char **argv)
 
     void *h = dlopen("libcuda.so.1", RTLD_NOW);
     if (!h) h = dlopen("libcuda.so", RTLD_NOW);
-    if (!h) { fprintf(stderr, "dlopen libcuda 失败: %s\n", dlerror()); return 1; }
+    if (!h) { fprintf(stderr, "dlopen libcuda failed: %s\n", dlerror()); return 1; }
 
     CUresult (*cuInit)(unsigned) = dlsym(h, "cuInit");
     CUresult (*cuDeviceGet)(CUdevice *, int) = dlsym(h, "cuDeviceGet");
@@ -42,38 +46,38 @@ int main(int argc, char **argv)
     const char *(*cuGetErrorString)(CUresult, const char **) = dlsym(h, "cuGetErrorString");
 
     if (!cuInit || !cuDeviceGet || !cuCtxCreate || !cuCtxDestroy) {
-        fprintf(stderr, "缺少 driver API 入口\n");
+        fprintf(stderr, "missing driver API entry points\n");
         return 1;
     }
-    /* cuCtxCreate_v2 不存在时退回无后缀名 */
+    /* fall back to the unsuffixed names when cuCtxCreate_v2 is absent */
     if (!cuCtxCreate) cuCtxCreate = dlsym(h, "cuCtxCreate");
     if (!cuCtxDestroy) cuCtxDestroy = dlsym(h, "cuCtxDestroy");
 
     CUresult r = cuInit(0);
-    if (r) { fprintf(stderr, "cuInit 失败 %d\n", r); return 1; }
+    if (r) { fprintf(stderr, "cuInit failed %d\n", r); return 1; }
 
     CUdevice dev;
     r = cuDeviceGet(&dev, 0);
-    if (r) { fprintf(stderr, "cuDeviceGet 失败 %d\n", r); return 1; }
+    if (r) { fprintf(stderr, "cuDeviceGet failed %d\n", r); return 1; }
 
     for (int i = 0; i < rounds; i++) {
         CUcontext ctx = NULL;
-        r = cuCtxCreate(&ctx, 0, dev);   /* ★ 这里会触发 _nv017281rm */
+        r = cuCtxCreate(&ctx, 0, dev);   /* ★ this triggers _nv017281rm */
         if (r) {
             const char *s = NULL;
             if (cuGetErrorString) cuGetErrorString(r, &s);
-            fprintf(stderr, "第 %d 轮 cuCtxCreate 失败 %d (%s)\n", i + 1, r, s ? s : "?");
+            fprintf(stderr, "round %d cuCtxCreate failed %d (%s)\n", i + 1, r, s ? s : "?");
             return 2;
         }
-        printf("第 %d 轮 ctx 创建成功 (%p)\n", i + 1, ctx);
+        printf("round %d ctx created (%p)\n", i + 1, ctx);
         fflush(stdout);
         usleep(200000);
         r = cuCtxDestroy(ctx);
-        if (r) { fprintf(stderr, "第 %d 轮 cuCtxDestroy 失败 %d\n", i + 1, r); return 3; }
-        printf("第 %d 轮 ctx 已销毁\n", i + 1);
+        if (r) { fprintf(stderr, "round %d cuCtxDestroy failed %d\n", i + 1, r); return 3; }
+        printf("round %d ctx destroyed\n", i + 1);
         fflush(stdout);
         usleep(200000);
     }
-    printf("完成 %d 轮，无 DMA\n", rounds);
+    printf("done %d rounds, no DMA\n", rounds);
     return 0;
 }

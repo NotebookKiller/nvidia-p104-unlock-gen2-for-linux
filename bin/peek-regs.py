@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""peek-regs.py —— 只读打印关键 BAR0 寄存器（不写）
+"""peek-regs.py — print the key BAR0 registers, read-only (no writes)
 
-用法：sudo python3 peek-regs.py
+Usage: sudo python3 peek-regs.py
 """
 import mmap
 import os
@@ -9,12 +9,12 @@ import struct
 import sys
 
 REGS = [
-    (0x88084, "LNKCAP 镜像 (MaxSpeed=bits[3:0])"),
-    (0x880A4, "LNKCAP2 镜像 (声明向量, 0x06=解锁)"),
-    (0x88088, "LNKSTA 镜像 (CurSpeed=bits[19:16])"),
-    (0x880A8, "LNKCTL2 镜像 (TLS=bits[3:0])"),
-    (0x8841C, "PRIV_MISC_1 (声明位)"),
-    (0x8872C, "XVE_OVR (写 6 = 触发训练)"),
+    (0x88084, "LNKCAP mirror (MaxSpeed=bits[3:0])"),
+    (0x880A4, "LNKCAP2 mirror (declared vector, 0x06=unlocked)"),
+    (0x88088, "LNKSTA mirror (CurSpeed=bits[19:16])"),
+    (0x880A8, "LNKCTL2 mirror (TLS=bits[3:0])"),
+    (0x8841C, "PRIV_MISC_1 (declaration bit)"),
+    (0x8872C, "XVE_OVR (write 6 = trigger training)"),
     (0x8C040, "LINK_CONFIG_0 (SPEED=bits[19:18])"),
     (0x8C2C0, "CYA_0 (bit2 = DIS_G2)"),
 ]
@@ -22,7 +22,7 @@ REGS = [
 
 def main():
     if os.geteuid() != 0:
-        print("需要 root"); return 1
+        print("root required"); return 1
     p = int(open("/sys/bus/pci/devices/%s/resource" % os.environ.get("DEV_BDF", "0000:01:00.0"))
             .readline().split()[0], 16)
     f = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)

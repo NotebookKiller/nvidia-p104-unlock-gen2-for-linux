@@ -1,35 +1,37 @@
 #!/usr/bin/env python3
-"""_patch.py —— JSON 规格驱动的通用二进制补丁器
+"""_patch.py — a generic binary patcher driven by a JSON spec
 
-被 00-whitelist.sh / 01-gen2-patch.sh 调用，不直接运行。
+Called by 00-whitelist.sh / 01-gen2-patch.sh; not run directly.
 
-用法（内部）：
+Usage (internal):
     python3 _patch.py <action> <spec_json>
 
-spec 结构：
+spec structure:
     {
       "name": "gen2",
-      "desc": "让驱动不再把 PCIe 速率降回 Gen1",
+      "desc": "stop the driver dropping the PCIe speed back to Gen1",
       "path": "/lib/modules/<kver>/updates/dkms/nvidia.ko",
-      "anchor": {"mode": "sig", "sig": "<hex>"}   或  {"mode": "offset", "off": 0},
+      "anchor": {"mode": "sig", "sig": "<hex>"}   or  {"mode": "offset", "off": 0},
       "edits": [
         {"off": 2, "old": "ff", "new": "fe", "what": "lea -1 -> lea -2"}
       ],
-      "md5_before": "...",      # 可选，仅用于提示
-      "md5_after": "...",       # 可选
-      "after_note": "..."       # 可选，apply 后打印
+      "md5_before": "...",      # optional, informational only
+      "md5_after": "...",       # optional
+      "after_note": "..."       # optional, printed after apply
     }
 
-设计要点：
-  · 三态判定：每处 edit 只有 "全 old" / "全 new" / "未知" 三种状态
-    只有「全 old」才允许 apply，只有「全 new」才允许 revert —— 混合态直接拒绝
-  · 备份 <path>.orig 只在 apply 且不存在时创建（revert 不删）
-  · md5 只作提示不阻断（文件可能叠加了别的补丁）
-  · 退出码：0 成功 / 1 失败 / 3 状态不符（拒绝操作）
+Design points:
+  · Three-state judgment: each edit is either "all old" / "all new" /
+    "unknown". Only "all old" allows apply, only "all new" allows revert —
+    mixed states are refused outright.
+  · Backup <path>.orig is only created on apply when absent (revert keeps it)
+  · md5 is informational only, never blocking (the file may carry other patches)
+  · Exit codes: 0 success / 1 failure / 3 state mismatch (operation refused)
 
-签名锚点（mode=sig）：
-  原始签名找不到时，会拿「补丁后的签名」再找一次 —— 这是为了正确识别
-  "已打过补丁" 的状态，而不是误报"驱动版本不匹配"。
+Signature anchor (mode=sig):
+  If the original signature is not found, the "patched signature" is
+  searched once more — this correctly recognizes an "already patched"
+  state instead of misreporting a "driver version mismatch".
 """
 import hashlib
 import json
@@ -38,7 +40,7 @@ import shutil
 import sys
 
 # ============================================================
-# 颜色与输出
+# Colors and output
 # ============================================================
 C_R, C_G, C_Y, C_B, C_0 = (
     "\033[31m", "\033[32m", "\033[33m", "\033[36m", "\033[0m")
@@ -52,15 +54,15 @@ def err(msg):  print(f"{C_R}✗{C_0} {msg}")
 
 
 # ============================================================
-# 工具
+# Utilities
 # ============================================================
 def parse_hex(s):
-    """'ff' / '0xff' 都接受（一律按十六进制），返回 bytes"""
+    """accepts 'ff' / '0xff' (always hex); returns bytes"""
     return bytes.fromhex(s[2:] if s.startswith("0x") else s)
 
 
 def find_all(data, pattern):
-    """返回 pattern 在 data 里所有出现位置"""
+    """return every position where pattern occurs in data"""
     positions, i = [], data.find(pattern)
     while i != -1:
         positions.append(i)
@@ -69,7 +71,8 @@ def find_all(data, pattern):
 
 
 def make_patched_sig(sig, edits):
-    """把原始签名按 edits 改成「补丁后」的形态，用于识别已打状态"""
+    """apply the edits to the original signature to get the 'patched'
+    form, used to recognize the already-patched state"""
     buf = bytearray(sig)
     for e in edits:
         new = parse_hex(e["new"])
@@ -78,15 +81,15 @@ def make_patched_sig(sig, edits):
 
 
 # ============================================================
-# 定位锚点
+# Anchor location
 # ============================================================
 def locate(data, spec):
-    """返回锚点基址。找不到 / 不唯一都直接退出。"""
+    """return the anchor base. Bail out if not found or not unique."""
     anchor = spec["anchor"]
 
     if anchor["mode"] == "offset":
         base = anchor["off"]
-        ok(f"使用固定偏移（基点 0x{base:x}）")
+        ok(f"using a fixed offset (base 0x{base:x})")
         return base
 
     sig = bytes.fromhex(anchor["sig"])
@@ -94,32 +97,32 @@ def locate(data, spec):
 
     if len(hits) == 1:
         base = hits[0]
-        ok(f"签名命中 1 处（文件偏移 0x{base:x}）")
+        ok(f"signature hits once (file offset 0x{base:x})")
         return base
 
     if len(hits) > 1:
-        err(f"签名命中 {len(hits)} 处（应为 1 处）—— 无法安全定位")
-        print("    拒绝继续。请人工确认。")
+        err(f"signature hits {len(hits)} places (expected 1) — cannot locate safely")
+        print("    refusing to continue. Confirm by hand.")
         sys.exit(3)
 
-    # 原始签名找不到：可能是已打过补丁，用补丁后的签名再试
+    # Original signature not found: possibly already patched; retry with the patched signature
     patched = make_patched_sig(sig, spec["edits"])
     hits = find_all(data, patched)
     if len(hits) == 1:
         base = hits[0]
-        ok(f"原始签名未命中，但补丁后签名命中 1 处（0x{base:x}）⇒ 应为已打补丁")
+        ok(f"original signature missed, but the patched signature hits once (0x{base:x}) => should already be patched")
         return base
 
-    err("签名一处都没命中 —— 驱动版本不匹配？")
-    print("    请先确认驱动版本，再重新定位签名（不要硬套本版本的偏移）")
+    err("the signature hit nowhere — wrong driver version?")
+    print("    Confirm the driver version first, then re-locate the signature (do not force-fit this version's offsets)")
     sys.exit(3)
 
 
 # ============================================================
-# 逐处检查状态
+# Per-edit state scan
 # ============================================================
 def scan_states(data, base, edits):
-    """返回 [(state, off, cur, old, new), ...]，state ∈ orig/new/unknown"""
+    """return [(state, off, cur, old, new), ...], state ∈ orig/new/unknown"""
     states = []
     for e in edits:
         off = base + e["off"]
@@ -137,7 +140,7 @@ def scan_states(data, base, edits):
 
 
 # ============================================================
-# 动作：check
+# Action: check
 # ============================================================
 def do_check(spec, data, md5_now, states, self_name):
     n_orig = sum(1 for s in states if s[0] == "orig")
@@ -146,44 +149,44 @@ def do_check(spec, data, md5_now, states, self_name):
 
     print(f"   md5 = {md5_now}")
     for st, off, cur, old, new in states:
-        mark = {"orig": "未打", "new": "已打", "unknown": "未知"}[st]
-        print(f"   0x{off:08x}  当前={cur.hex():<6s} {mark}")
+        mark = {"orig": "orig", "new": "new", "unknown": "unknown"}[st]
+        print(f"   0x{off:08x}  cur={cur.hex():<6s} {mark}")
 
     print()
     if n_orig == len(states):
-        warn("状态：未打补丁")
-        print(f"    打补丁: sudo bash {self_name} apply")
+        warn("state: not patched")
+        print(f"    patch it: sudo bash {self_name} apply")
     elif n_new == len(states):
-        ok("状态：已打补丁")
-        print(f"    还原:   sudo bash {self_name} revert")
+        ok("state: patched")
+        print(f"    revert:  sudo bash {self_name} revert")
     else:
-        err(f"状态异常：{n_orig} 处原始 / {n_new} 处已改 / {n_unk} 处未知")
-        print("    文件可能被别的工具改过，或驱动版本不匹配。不要盲目 apply。")
+        err(f"abnormal state: {n_orig} orig / {n_new} changed / {n_unk} unknown")
+        print("    The file may have been modified by another tool, or the driver version mismatches. Do not apply blindly.")
         sys.exit(3)
     sys.exit(0)
 
 
 # ============================================================
-# 动作：apply / revert
+# Action: apply / revert
 # ============================================================
 def do_write(action, spec, data, md5_now, states, path):
     want_from = "orig" if action == "apply" else "new"
 
-    # 状态必须「全 orig」或「全 new」，混合态拒绝
+    # The state must be "all orig" or "all new"; mixed states are refused
     if not all(s[0] == want_from for s in states):
-        err(f"状态不符合预期，拒绝 {action}")
+        err(f"state does not match expectations; refusing {action}")
         for st, off, cur, old, new in states:
-            want = ("原始 " + old.hex()) if action == "apply" else ("已打 " + new.hex())
-            print(f"   0x{off:08x}  当前={cur.hex()}  期望={want}")
+            want = ("orig " + old.hex()) if action == "apply" else ("patched " + new.hex())
+            print(f"   0x{off:08x}  cur={cur.hex()}  expected={want}")
         sys.exit(3)
 
-    # 备份：只在 apply 且 .orig 不存在时创建
+    # Backup: only create on apply when .orig is absent
     bak = path + ".orig"
     if action == "apply" and not os.path.exists(bak):
         shutil.copy2(path, bak)
-        ok(f"已备份 → {os.path.basename(bak)}")
+        ok(f"backed up -> {os.path.basename(bak)}")
 
-    # 写回
+    # Write back
     for st, off, cur, old, new in states:
         target = new if action == "apply" else old
         data[off:off + len(target)] = target
@@ -199,31 +202,31 @@ def do_write(action, spec, data, md5_now, states, path):
         print(f"   0x{off:08x}  {cur.hex()} → {target.hex()}   {e['what']}")
 
     print()
-    ok(f"{action} 完成")
+    ok(f"{action} done")
     print(f"   md5: {md5_now} → {md5_after}")
 
-    # md5 校验（仅提示，不阻断）
-    # apply 时：写前=before、写后=after；revert 时反过来
+    # md5 verification (informational only, never blocking)
+    # On apply: before-write=before, after-write=after; reversed on revert
     if action == "apply":
-        checks = [("写前", md5_now, spec.get("md5_before")),
-                  ("写后", md5_after, spec.get("md5_after"))]
+        checks = [("before-write ", md5_now, spec.get("md5_before")),
+                  ("after-write  ", md5_after, spec.get("md5_after"))]
     else:
-        checks = [("写前", md5_now, spec.get("md5_after")),
-                  ("写后", md5_after, spec.get("md5_before"))]
+        checks = [("before-write ", md5_now, spec.get("md5_after")),
+                  ("after-write  ", md5_after, spec.get("md5_before"))]
 
     for label, got, expect in checks:
         if not expect:
             continue
         if got == expect:
-            ok(f"md5 {label}与记录一致（{expect[:8]}…）")
+            ok(f"md5 {label}matches the record ({expect[:8]}…)")
         else:
-            warn(f"md5 {label}与记录不一致（记录 {expect[:8]}…，实际 {got[:8]}…）")
-            # 说明为什么会不一致 —— 最常见的原因就是"先打了 00 白名单"
-            print("      ⓘ 这不是错误，不影响执行（md5 仅用于提示，不阻断）。")
-            print("        最常见原因：这份文件上还叠了别的补丁 / 重新编译过。")
-            print("        例如先跑过 00-whitelist（改 nv-kernel.o_binary → 重编 nvidia.ko），")
-            print("        nvidia.ko 的 md5 就必然和「原厂」记录对不上 —— 这是预期行为。")
-            print("        真正的安全网是：32 字节签名唯一定位 + 三态校验（混合态拒绝）。")
+            warn(f"md5 {label}differs from the record (recorded {expect[:8]}…, actual {got[:8]}…)")
+            # Explain why it can differ — the most common cause is "the 00 whitelist was applied first"
+            print("      ⓘ This is not an error and does not affect execution (md5 is informational only, never blocking).")
+            print("        Most common cause: this file carries other patches on top / was recompiled.")
+            print("        For example, after running 00-whitelist (changing nv-kernel.o_binary -> rebuilding nvidia.ko),")
+            print("        nvidia.ko's md5 necessarily no longer matches the \"factory\" record — that is expected.")
+            print("        The real safety net is: unique 32-byte signature location + three-state verification (mixed states refused).")
 
     if action == "apply" and spec.get("after_note"):
         print()
@@ -235,7 +238,7 @@ def do_write(action, spec, data, md5_now, states, path):
 # ============================================================
 def main():
     if len(sys.argv) < 4:
-        err("内部用法: _patch.py <action> <spec_json> <parent_script>")
+        err("internal usage: _patch.py <action> <spec_json> <parent_script>")
         return 1
 
     action = sys.argv[1]
@@ -243,11 +246,11 @@ def main():
     self_name = os.path.basename(sys.argv[3])
 
     path = spec["path"]
-    print(f"   文件: {path}")
+    print(f"   file: {path}")
 
     if not os.path.exists(path):
-        err(f"文件不存在：{path}")
-        print("    请确认驱动版本与安装路径")
+        err(f"file not found: {path}")
+        print("    Check the driver version and install path")
         return 3
 
     data = bytearray(open(path, "rb").read())
@@ -261,7 +264,7 @@ def main():
     elif action in ("apply", "revert"):
         do_write(action, spec, data, md5_now, states, path)
     else:
-        err(f"未知动作 {action}")
+        err(f"unknown action {action}")
         return 1
 
     return 0

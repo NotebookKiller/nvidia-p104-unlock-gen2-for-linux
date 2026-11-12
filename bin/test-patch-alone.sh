@@ -1,25 +1,28 @@
 #!/bin/bash
-# test-patch-alone.sh —— 验证「只有补丁、没有推送」时链路到不了 Gen2
+# test-patch-alone.sh — verify that with "the patch only, no push" the link
+# cannot reach Gen2
 #
-# ## 结论（reports/200 §1，已用整机重启实测过）
-#   补丁在位、gen2kr 未加载时：
-#     LNKSTA=1、LCAP2=0x0002、TLS=1、0x8841C=0xc0b40500、带宽 0.78
-#   ⇒ **补丁只能"保持" Gen2，不能"建立" Gen2。**
+# ## Conclusion (reports/200 §1, already measured with a full-machine reboot)
+#   With the patch in place and gen2kr not loaded:
+#     LNKSTA=1, LCAP2=0x0002, TLS=1, 0x8841C=0xc0b40500, bandwidth 0.78
+#   => **the patch can only "hold" Gen2; it cannot "establish" Gen2.**
 #
-# ## ★ 怎么才能复位到"声明未解锁"
-#   **`unbind/bind` 不行！** 实测声明解锁是跨 unbind/bind 保持的
-#   （reports/200 §3：解绑/绑定前后 CAP2 都是 0x0006、链路都是 Gen2）。
+# ## ★ How to reset to "declaration not unlocked"
+#   **`unbind/bind` will NOT do it!** Measured: the declaration unlock survives
+#   across unbind/bind (reports/200 §3: CAP2 was 0x0006 before and after
+#   unbind/bind, and the link stayed Gen2 both times).
 #
-#   能复位的只有两条：
-#     · `rmmod nvidia && modprobe nvidia`（快，但反复 reload 有锁死风险）
-#     · 整机重启（最干净）
+#   Only two things can reset it:
+#     · `rmmod nvidia && modprobe nvidia` (fast, but repeated reloads risk a
+#       driver-side lock-up)
+#     · a full machine reboot (cleanest)
 #
-#   本脚本默认走 **模块重载**（快），但会先警告。
-#   想跳过复位、只观察当前状态，用 `--no-reset`。
+#   This script defaults to the **module reload** (fast) path but warns first.
+#   To skip the reset and only observe the current state, use `--no-reset`.
 #
-# 用法：
-#   bash test-patch-alone.sh              # 模块重载复位后，用补丁独立尝试
-#   bash test-patch-alone.sh --no-reset   # 只看现状，不复位
+# Usage:
+#   bash test-patch-alone.sh              # reset via module reload, then try with the patch alone
+#   bash test-patch-alone.sh --no-reset   # observe the current state only, no reset
 set -u
 D="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 DEV="${DEV_BDF:-0000:01:00.0}"
@@ -41,76 +44,76 @@ try:
     print(f"CAP2=0x{cap2:04x} LNKSTA={(ls>>16)&0xF} TLS={ctl2&0xF} "
           f"SPEED={(cfg>>18)&3} MAXSPD={cap&0xF} 0x8841C=0x{priv:08x}")
 except Exception:
-    print("读不到")
+    print("unreadable")
 PY
 }
 
-echo "======== 0. 起点 ========"
+echo "======== 0. starting point ========"
 echo "  $(st)"
-echo -n "  gen2kr: "; lsmod | grep -q '^gen2kr' && echo "已加载" || echo "未加载"
-echo -n "  补丁  : "; python3 "$D/bin/patch_no_gen1.py" check 2>/dev/null | grep -oE "未打补丁|已打补丁"
+echo -n "  gen2kr: "; lsmod | grep -q '^gen2kr' && echo "loaded" || echo "not loaded"
+echo -n "  patch : "; python3 "$D/bin/patch_no_gen1.py" check 2>/dev/null | grep -oE '\[not patched\]|\[patched\]'
 
 echo
-echo "======== 1. 摘掉 gen2kr（确保没有任何推送者）========"
+echo "======== 1. remove gen2kr (make sure no pusher remains) ========"
 if lsmod | grep -q '^gen2kr'; then
-    rmmod gen2kr && echo "  已卸载"
+    rmmod gen2kr && echo "  removed"
 fi
 sleep 1
-lsmod | grep -q '^gen2kr' && echo "  ⚠ 还在" || echo "  确认已无 gen2kr"
+lsmod | grep -q '^gen2kr' && echo "  ⚠ still present" || echo "  confirmed: no gen2kr left"
 
 if [ "$RESET" = "1" ]; then
     echo
-    echo "======== 2. 重载 nvidia 模块，把声明复位回 Gen1 ========"
-    echo "  ★ 不能用 unbind/bind —— 它不会重置声明（reports/200 §3）"
-    echo "  ★ 反复 reload 有进入驱动侧锁死态的风险；若失败请整机重启"
+    echo "======== 2. reload the nvidia modules to reset the declaration back to Gen1 ========"
+    echo "  ★ unbind/bind cannot be used —— it does not reset the declaration (reports/200 §3)"
+    echo "  ★ repeated reloads risk a driver-side lock-up; if it fails, reboot the whole machine"
     for m in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
         rmmod "$m" 2>/dev/null || true
     done
     sleep 1
     if lsmod | grep -qE '^nvidia'; then
-        echo "  ✗ nvidia 未卸干净（查 fuser -v /dev/nvidia*），中止"
+        echo "  ✗ nvidia did not fully unload (check fuser -v /dev/nvidia*); aborting"
         exit 1
     fi
-    modprobe nvidia && modprobe nvidia_uvm && echo "  已重载"
+    modprobe nvidia && modprobe nvidia_uvm && echo "  reloaded"
     sleep 3
-    echo "  复位后: $(st)"
+    echo "  after reset: $(st)"
 else
     echo
-    echo "======== 2. 跳过复位（--no-reset）========"
+    echo "======== 2. skipping the reset (--no-reset) ========"
 fi
 
 echo
-echo "======== 3. 观察 10 秒（只有补丁，没人推送）========"
+echo "======== 3. watch for 10 seconds (only the patch; nobody pushes) ========"
 for i in 1 2 3 4 5; do
     sleep 2
     echo "   $((i*2))s: $(st)"
 done
 
 echo
-echo "======== 4. 结论 ========"
+echo "======== 4. verdict ========"
 S="$(st)"
 case "$S" in
   *LNKSTA=2*)
     if [ "$RESET" = "0" ]; then
-      echo "  链路是 Gen2 —— 但很可能是之前推送的残留"
-      echo "  （声明解锁跨 unbind/bind 保持，见 reports/200 §3）。"
-      echo "  要真正测「只有补丁」，去掉 --no-reset 重跑，或整机重启后再测。"
+      echo "  the link is Gen2 —— but very likely leftover from the earlier push"
+      echo "  (the declaration unlock survives unbind/bind, see reports/200 §3)."
+      echo "  To really test \"the patch alone\", rerun without --no-reset, or reboot the machine first."
     else
-      echo "  ★ 复位后仍到 Gen2 —— 与 reports/200 的结论不一致，需复查"
+      echo "  ★ still reached Gen2 after the reset —— inconsistent with reports/200; re-verify"
     fi
     ;;
   *)
-    echo "  ✓ 符合预期：链路仍是 Gen1"
-    echo "    ⇒ 补丁只能【保持】Gen2，不能【建立】Gen2。"
-    echo "    ⇒ 光装 patch 过的驱动不够，必须有 gen2kr 做那次推送。"
+    echo "  ✓ as expected: the link is still Gen1"
+    echo "    => the patch can only [hold] Gen2; it cannot [establish] Gen2."
+    echo "    => installing the patched driver alone is not enough; gen2kr must make that one push."
     ;;
 esac
-echo "  当前: $S"
+echo "  current: $S"
 
 echo
-echo "======== 5. 恢复（重新加载 gen2kr 并推送）========"
+echo "======== 5. restore (reload gen2kr and push) ========"
 if ! lsmod | grep -q '^gen2kr'; then
-    insmod "$D/build/gen2kr.ko" 2>/dev/null && echo "  gen2kr 已加载"
+    insmod "$D/build/gen2kr.ko" 2>/dev/null && echo "  gen2kr loaded"
 fi
 sleep 1
 echo "$DEV" > /sys/bus/pci/drivers/nvidia/unbind 2>/dev/null
@@ -120,8 +123,8 @@ for i in $(seq 1 30); do
     case "$(st)" in *LNKSTA=2*) break;; esac
     sleep 0.5
 done
-echo "  恢复后: $(st)"
+echo "  after restore: $(st)"
 case "$(st)" in
-  *LNKSTA=2*) echo "  ✓ 已恢复 Gen2" ;;
-  *) echo "  ⚠ 未恢复。若连续失败，按 reports/198：整机重启，不要再试" ;;
+  *LNKSTA=2*) echo "  ✓ Gen2 restored" ;;
+  *) echo "  ⚠ not restored. If this fails repeatedly, follow reports/198: reboot the whole machine and stop retrying" ;;
 esac

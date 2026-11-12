@@ -1,11 +1,11 @@
 #!/bin/bash
-# _common.sh —— 公共路径、寄存器读取与判定
-# 所有脚本 source 这个文件，保证包可整体搬移。
+# _common.sh — shared paths, register reads, and verdicts
+# All scripts source this file so the package can be relocated as a whole.
 #
-# 设计约束（踩过的坑）：
-#   · 不用 $(( )) 处理 0xffffffffc185a000（dash 报 Illegal number，>2^63）
-#   · 地址一律交给 python 算
-#   · 读 /dev/mem 必须 O_RDWR（O_RDONLY + PROT_WRITE 会 PermissionError）
+# Design constraints (learned from real incidents):
+#   · Never use $(( )) on values like 0xffffffffc185a000 (dash says "Illegal number", >2^63)
+#   · Always let python do the address math
+#   · Reading /dev/mem requires O_RDWR (O_RDONLY + PROT_WRITE raises PermissionError)
 
 PKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PKG_ROOT/build"
@@ -15,30 +15,32 @@ DRIVERS_DIR="$PKG_ROOT/drivers"
 KVER="$(uname -r)"
 KO="/lib/modules/${KVER}/updates/dkms/nvidia.ko"
 
-# ---------- 定位内核模块源码目录 ----------
+# ---------- Locate the kernel module source directory ----------
 #
-# 内核模块按「驱动版本 / 内核版本」两级归档：
-#   drivers/<驱动版本>/kernel/<内核版本>/gen2kr.c
+# Kernel module sources are archived two levels deep, by driver version / kernel version:
+#   drivers/<driver version>/kernel/<kernel version>/gen2kr.c
 #
-# 为什么内核版本要进目录名：模块的**编译产物**与内核头强绑定
-# （不同内核的 ABI、符号、结构体偏移都可能不同），
-# 源码本身用的是稳定 API，但「在哪编过、验过」必须能一眼看出。
+# Why the kernel version is part of the directory name: the **build artifact**
+# is tightly bound to the kernel headers (ABI, symbols, and struct offsets can
+# all differ between kernels). The source itself uses the stable API, but
+# "where it was built and validated" must be visible at a glance.
 #
-# 匹配规则：
-#   1. 优先找与当前内核完全对应的目录（uname -r 去掉 +deb13-amd64 这类后缀）
-#   2. 找不到就退到「仓库里只有一套」的情况
-#   3. 都没有则 KMOD_DIR 为空，调用方自行报错
-KVER_SHORT="${KVER%%+*}"        # 6.12.113+deb13-amd64 → 6.12.113
+# Match rules:
+#   1. Prefer the directory that exactly matches the current kernel (uname -r
+#      with suffixes like +deb13-amd64 stripped off)
+#   2. If not found, fall back to the "only one set exists in the repo" case
+#   3. If neither exists, KMOD_DIR stays empty and the caller reports the error
+KVER_SHORT="${KVER%%+*}"        # 6.12.113+deb13-amd64 -> 6.12.113
 
 find_kmod_dir() {
     local d
 
-    # 1) 精确匹配当前内核
+    # 1) Exact match on the current kernel
     for d in "${DRIVERS_DIR}"/*/kernel/"${KVER_SHORT}"; do
         [ -d "${d}" ] && { echo "${d}"; return 0; }
     done
 
-    # 2) 退路：只有一套就先用它（会在 10-check 里提示版本可能不符）
+    # 2) Fallback: if there is only one set, use it (10-check warns about a possible version mismatch)
     for d in "${DRIVERS_DIR}"/*/kernel/*; do
         [ -d "${d}" ] && { echo "${d}"; return 0; }
     done
@@ -49,9 +51,9 @@ find_kmod_dir() {
 KMOD_DIR="$(find_kmod_dir || true)"
 LOG_DIR="$PKG_ROOT/history/logs"
 
-# DEV_BDF / DEV_SHORT / ROOT_BDF 由下方 discover_dev_bdf() 自动发现
+# DEV_BDF / DEV_SHORT / ROOT_BDF are auto-discovered by discover_dev_bdf() below
 
-# BAR0 寄存器（只读用途）
+# BAR0 registers (read-only use)
 R_LNKCAP=0x88084
 R_LNKCAP2=0x880A4
 R_LNKSTA=0x88088
@@ -61,7 +63,7 @@ R_LTSSM=0x8872C
 R_LINKCFG0=0x8C040
 R_CYA=0x8C2C0
 
-# ---------- 颜色（非 tty 自动关闭） ----------
+# ---------- Colors (automatically off when not a tty) ----------
 if [ -t 1 ]; then
     C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[36m'; C_0=$'\033[0m'
 else
@@ -72,10 +74,11 @@ warn() { echo "${C_Y}⚠${C_0} $*"; }
 err()  { echo "${C_R}✗${C_0} $*"; }
 hdr()  { echo; echo "${C_B}=== $* ===${C_0}"; }
 
-# ---------- 目标设备自动发现（单一来源：drivers/<版本>/utils/bdf.sh） ----------
-# ★ 不要在这里再写一份 —— 重复实现会导致两处不一致，
-#   典型症状：10-check 说「P104 在总线」，但读出来的 cfg 是另一张卡的。
-#   TARGET_IDS / TARGET_BDF 由 bdf.sh 处理。
+# ---------- Target device auto-discovery (single source: drivers/<version>/utils/bdf.sh) ----------
+# ★ Do not write a second copy here — duplicate implementations drift apart.
+#   Typical symptom: 10-check says "the P104 is on the bus" but the config
+#   reads come back from a different card.
+#   TARGET_IDS / TARGET_BDF are handled by bdf.sh.
 _bdf_lib=""
 if [ -n "${GEN2_BDF_LIB:-}" ] && [ -r "${GEN2_BDF_LIB}" ]; then
     _bdf_lib="${GEN2_BDF_LIB}"
@@ -86,8 +89,8 @@ else
 fi
 
 if [ -z "${_bdf_lib}" ]; then
-    err "找不到 drivers/<版本>/utils/bdf.sh（仓库结构不完整）"
-    echo "    期望位置：${DRIVERS_DIR}/<版本>/utils/bdf.sh"
+    err "Cannot find drivers/<version>/utils/bdf.sh (repo layout incomplete)"
+    echo "    Expected location: ${DRIVERS_DIR}/<version>/utils/bdf.sh"
     exit 3
 fi
 
@@ -95,8 +98,8 @@ fi
 source "${_bdf_lib}"
 
 
-# ---------- 只读：读 BAR0 一组寄存器 ----------
-# 输出一行：CAP2=0x0006 LNKSTA=2 TLS=2 SPEED=1 MAXSPD=2
+# ---------- Read-only: read a group of BAR0 registers ----------
+# Prints one line: CAP2=0x0006 LNKSTA=2 TLS=2 SPEED=1 MAXSPD=2
 read_regs() {
 python3 - <<'PY'
 import mmap, os, struct, sys
@@ -116,14 +119,14 @@ except Exception:
 PY
 }
 
-# 只取 LNKSTA[3:0]（唯一可信的"当前速率"判据）
+# LNKSTA[3:0] only (the only trustworthy "current speed" verdict)
 cur_speed() {
     local s
     s="$(_r 0x88088)"
     python3 -c "print((${s:-0}>>16)&0xF)" 2>/dev/null || echo 0
 }
 
-# 只取 CAP2（声明向量，0x06 = 已解锁支持 Gen2）
+# CAP2 only (declaration vector; 0x06 = Gen2 support unlocked)
 cap2() {
     local v
     v="$(_r 0x880A4)"
@@ -146,7 +149,8 @@ except Exception:
 PY
 }
 
-# 判活：连续 20 次 0xffffffff 才算失效（单次是重训瞬态，不是异常）
+# Liveness: only after 20 consecutive 0xffffffff reads call it dead
+# (a single hit is a retrain transient, not a fault)
 alive() {
     local bad=0 i v
     for i in $(seq 1 20); do
@@ -160,7 +164,7 @@ alive() {
     return 1
 }
 
-# 判 Gen2（★ 只看寄存器，绝不用 nvidia-smi，也绝不用 grep 'Speed 5GT/s'）
+# Gen2 verdict (★ registers only; never nvidia-smi; never grep 'Speed 5GT/s')
 is_gen2() { [ "$(cur_speed)" = "2" ]; }
 
 wait_gen2() {
@@ -173,33 +177,37 @@ wait_gen2() {
 }
 
 need_root() {
-    [ "$(id -u)" = "0" ] || { err "需要 root（sudo bash $0）"; exit 1; }
+    [ "$(id -u)" = "0" ] || { err "root required (sudo bash $0)"; exit 1; }
 }
 
-# 判定是否处于「驱动侧锁死态」
+# Detect the "driver-side stuck state"
 #
-# ★ 不能只看 "CAP2=0x0002 + TLS=1 + Gen1" —— 那正是**原厂未解锁**的样子，
-#   刚重启的干净机器也是这个状态（踩过：干净重启后误报警告）。
+# ★ Do not judge by "CAP2=0x0002 + TLS=1 + Gen1" alone — that is exactly what
+#   the stock, un-unlocked state looks like, and a freshly rebooted clean
+#   machine shows it too (burned once: a clean reboot produced a false alarm).
 #
-# 真正的锁死态特征：**我们写过解锁位，但没生效**
-#   · 0x8841C 的 bit15|bit13|bit11 已置位（= 写过解锁）
-#   · 但 CAP2 仍是 0x0002（= 没锁存成功）
-#   · 且链路仍是 Gen1
+# The real stuck-state signature: **we wrote the unlock bits but they did not take**
+#   · bits 15|13|11 of 0x8841C are set (= the unlock was written)
+#   · yet CAP2 is still 0x0002 (= the latch did not succeed)
+#   · and the link is still Gen1
 #
-# 原厂 0x8841C = 0xc0b40500 → (v & 0xA800) == 0
-# 解锁 0x8841C = 0xc0b4ad00 → (v & 0xA800) == 0xA800
+# Stock 0x8841C = 0xc0b40500 -> (v & 0xA800) == 0
+# Unlocked 0x8841C = 0xc0b4ad00 -> (v & 0xA800) == 0xA800
 is_stuck() {
     local i cfg cap spd
-    # ★ 必须稳定观测，不能单次采样就判死。
-    #   写完解锁位、但重训还没完成时，0x8C040/0x8841C 已经是"写过"的样子，
-    #   而 LNKSTA 仍是 1 —— 此时单次采样会误报锁死，随后的 push 往往能成功。
-    #   （实测：成功那版也打印了"检测到锁死"，但第 3 节正常升到 Gen2。）
-    #   ⇒ 连续 3 次（间隔 0.7s，共约 1.4s，超过重训窗口）全部满足才算。
+    # ★ The observation must be stable; a single sample is not enough to declare "stuck".
+    #   Right after writing the unlock bits but before the retrain completes,
+    #   0x8C040/0x8841C already look "written" while LNKSTA is still 1 —
+    #   a single sample then reports a false stuck state, and the following
+    #   push usually succeeds anyway.
+    #   (Measured: the successful run also printed "stuck detected", yet
+    #   section 3 still raised the link to Gen2 normally.)
+    #   => Require 3 consecutive hits (0.7s apart, ~1.4s total, beyond the retrain window).
     for i in 1 2 3; do
         cfg="$(_r 0x8841C)"
         cap="$(cap2)"
         spd="$(cur_speed)"
-        # 任一次读到「解锁位未置位」或「已升到 Gen2」→ 立刻判否
+        # Any single observation with "unlock bits not set" or "already at Gen2" => not stuck
         if [ "$(( cfg & 0xA800 ))" = "0" ] || [ "${cap}" != "2" ] || [ "${spd}" != "1" ]; then
             return 1
         fi
@@ -208,18 +216,18 @@ is_stuck() {
     return 0
 }
 
-# 检查探针是否就绪。默认只检查不编译（保持"只读脚本"的承诺）。
-# 传 auto 时才自动编译。
+# Check that the probes are built. By default only check, never compile
+# (keeps the "read-only script" promise). Pass "auto" to allow auto-compiling.
 ensure_build() {
     local mode="${1:-check}"
     if [ -x "$BUILD_DIR/minictx" ] && [ -x "$BUILD_DIR/bwtest2" ]; then
         return 0
     fi
     if [ "$mode" = "auto" ]; then
-        warn "build/ 里缺少探针，正在编译..."
+        warn "probes missing in build/, compiling..."
         bash "$PKG_ROOT/bin/build.sh" || return 1
         return 0
     fi
-    warn "build/ 里缺少探针（minictx / bwtest2）→ 先跑: bash $PKG_ROOT/bin/build.sh"
+    warn "probes missing in build/ (minictx / bwtest2) -> run first: bash $PKG_ROOT/bin/build.sh"
     return 1
 }

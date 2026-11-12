@@ -1,70 +1,73 @@
 #!/usr/bin/env python3
-"""patch_no_gen1.py —— 阻止驱动在 cuInit 时把链路降回 Gen1
+"""patch_no_gen1.py — stop the driver from downgrading the link back to Gen1 at cuInit
 
-## 结论前置（reports/199 实测）
+## Conclusion first (measured in reports/199)
 
-perf 四点断点，一次 `minictx`（1 个 CUDA 上下文）：
+perf four breakpoints, one `minictx` run (1 CUDA context):
 
 ```
-entry     0x127d60  1 次   DX=0x1                       ← mode = 1
-or80000   0x127e65  1 次   AX 0x20505800                ← 清掉 SPEED[19:18]
-wr_shared 0x127edd  1 次   R8=0x20585800                ← ★ SPEED=2 真的写进去了
-bailret   0x1280c8  1 次
+entry     0x127d60  1 time  DX=0x1                      <- mode = 1
+or80000   0x127e65  1 time  AX 0x20505800               <- SPEED[19:18] cleared
+wr_shared 0x127edd  1 time  R8=0x20585800               <- ★ SPEED=2 really got written
+bailret   0x1280c8  1 time
 ```
 
-⇒ **SPEED=2 是软件写的，不是端点内部回写**。
-  （reports/195/197 的"CPU 不可见"结论作废：那次断点是没生效。）
+=> **SPEED=2 is written by software, not by an endpoint-side writeback**.
+   (The "CPU-invisible" conclusion from reports/195/197 is void: that time the
+   breakpoints simply did not take effect.)
 
-## 为什么改「范围检查边界」比 A/B/C 都干净
+## Why moving the "range-check boundary" is cleaner than A/B/C
 
-`_nv017105rm(dev, obj, mode)` 入口是一段白名单检查：
+The entry of `_nv017105rm(dev, obj, mode)` is a whitelist check:
 
 ```asm
 127d66: 8d 42 ff        lea  -0x1(%rdx),%eax     ; eax = mode - 1
 127d81: 83 f8 02        cmp  $0x2,%eax
-127d84: 0f 87 3e 03 00 00  ja 1280c8             ; (mode-1) > 2 → bail（即 mode ∉ {1,2,3}）
+127d84: 0f 87 3e 03 00 00  ja 1280c8             ; (mode-1) > 2 -> bail (i.e. mode not in {1,2,3})
 ```
 
-把它平移成 **`mode - 2` / `cmp $0x1`**：
+Translate it into **`mode - 2` / `cmp $0x1`**:
 
 ```asm
 127d66: 8d 42 fe        lea  -0x2(%rdx),%eax     ; eax = mode - 2
 127d81: 83 f8 01        cmp  $0x1,%eax
-127d84: 0f 87 ...       ja   1280c8              ; (mode-2) > 1 → bail
+127d84: 0f 87 ...       ja   1280c8              ; (mode-2) > 1 -> bail
 ```
 
-新的 bail 条件（无符号）：
+The new bail condition (unsigned):
 
-| mode | mode-2 | > 1 ? | 结果 |
+| mode | mode-2 | > 1? | result |
 |---|---|---|---|
-| 1 | `0xFFFFFFFF`（下溢） | 是 | **bail** ★ 唯一的行为变化 |
-| 2 | 0 | 否 | 继续（Gen2） |
-| 3 | 1 | 否 | 继续（Gen3） |
-| ≥4 | ≥2 | 是 | bail（**与原来完全一致**） |
+| 1 | `0xFFFFFFFF` (underflow) | yes | **bail** ★ the only behavior change |
+| 2 | 0 | no | continue (Gen2) |
+| 3 | 1 | no | continue (Gen3) |
+| >=4 | >=2 | yes | bail (**identical to the original**) |
 
-⇒ **唯一的行为差异就是 mode==1 从"执行"变成"bail"**，其余位、其余分支、其余 mode 全部不变。
+=> **The only behavioral difference is that mode==1 changes from "execute" to "bail"**;
+   every other bit, every other branch, every other mode stays unchanged.
 
-### 为什么 bail 是安全的
-- `1280c8` 是函数**唯一**的 return 点：`pop %rbx; mov %r12d,%eax; pop×4; add $0x40,%rbp; ret`
-- `%r12d` 在 entry 就被 `xor %r12d,%r12d` 置 0，而 mode=1 路径里对 `%r12` 的改写
-  （`lea 0x1e08(%r13),%r12`）在我们跳过的代码里
-- ⇒ bail 返回 **0 = CUDA_SUCCESS**，驱动认为设置成功，不会报错、不会重试
+### Why bail is safe
+- `1280c8` is the function's **only** return point: `pop %rbx; mov %r12d,%eax; pop x4; add $0x40,%rbp; ret`
+- `%r12d` is zeroed at entry by `xor %r12d,%r12d`, and the mode==1 path's write to
+  `%r12` (`lea 0x1e08(%r13),%r12`) lives in the code we skip
+- => bail returns **0 = CUDA_SUCCESS**, so the driver considers the set successful,
+  does not report an error and does not retry
 
-## 与 A/B/C 的对比
+## Comparison with A/B/C
 
-| 方案 | 改什么 | 评价 |
+| approach | what it changes | verdict |
 |---|---|---|
-| A 入口加 `cmp $1,%edx; je ret` | 需要 code cave | 该函数没有空隙可塞 5 字节；且要处理 CET/IBT |
-| B 改 `je .mode1_case` 目标 | —— | **不存在这条指令**：mode==1 是**顺序落入**，不是跳转过来的 |
-| C nop 掉 `or $0x80000` | 1 条指令 | 会落到 `movl $0x1,0xc(%rbp)`（改存储的 mode），语义不清 |
-| **本方案** | **2 个字节** | 边界平移，白名单收窄，零附带影响 |
+| A: add `cmp $1,%edx; je ret` at entry | needs a code cave | the function has no slack to fit 5 bytes; CET/IBT would need handling too |
+| B: retarget `je .mode1_case` | — | **that instruction does not exist**: mode==1 falls through sequentially, it is not jumped to |
+| C: nop out `or $0x80000` | 1 instruction | would fall into `movl $0x1,0xc(%rbp)` (the stored mode); semantics unclear |
+| **this approach** | **2 bytes** | boundary shift, whitelist narrowed, zero side effects |
 
-## 用法
+## Usage
   sudo python3 patch_no_gen1.py check
   sudo python3 patch_no_gen1.py apply
   sudo python3 patch_no_gen1.py revert
 
-⚠ apply 后必须重载 nvidia 模块（或重启）才生效。
+⚠ After apply the nvidia module must be reloaded (or the machine rebooted) for it to take effect.
 """
 import hashlib
 import os
@@ -76,9 +79,9 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 
 def resolve_ko():
-    """找到真正的 nvidia.ko，可能是 .ko 也可能是 .ko.zst（DKMS/发行版常见）。
+    """Locate the real nvidia.ko, which may be .ko or .ko.zst (common with DKMS/distro packaging).
 
-    顺序：TARGET_KO 环境变量 → modinfo -n nvidia → 几个常见路径。
+    Order: TARGET_KO env var -> modinfo -n nvidia -> a few well-known paths.
     """
     kv = os.uname().release
     cands = []
@@ -117,7 +120,7 @@ BAK = (KO + ".orig_nogen1") if KO else ""
 
 
 def load_ko(path):
-    """读入**解压后的** ELF 字节。.zst 会先 zstd -d 到内存。"""
+    """Read the **decompressed** ELF bytes. A .zst file is decompressed in memory with `zstd -d` first."""
     with open(path, "rb") as f:
         raw = f.read()
     if raw[:4] != ZSTD_MAGIC:
@@ -125,16 +128,17 @@ def load_ko(path):
     try:
         r = subprocess.run(["zstd", "-d", "-c", "--", path], capture_output=True)
     except OSError:
-        raise RuntimeError("需要 zstd 命令来解压 .ko.zst（apt install zstd）")
+        raise RuntimeError("the zstd command is required to decompress .ko.zst (apt install zstd)")
     if r.returncode != 0:
-        raise RuntimeError("zstd 解压失败：%s" % r.stderr.decode("utf-8", "replace")[:200])
+        raise RuntimeError("zstd decompression failed: %s" % r.stderr.decode("utf-8", "replace")[:200])
     return r.stdout
 
 
 def store_ko(path, data):
-    """把**解压后**的 ELF 字节写回磁盘；原文件是 .zst 就重新压缩。
+    """Write the **decompressed** ELF bytes back to disk; recompress if the original file is .zst.
 
-    用「写临时文件 + os.replace」保证原子性，避免中途失败留下半截 .ko。
+    Uses "write temp file + os.replace" for atomicity so a mid-way failure cannot leave a
+    half-written .ko behind.
     """
     st = os.stat(path)
     tmp = path + ".new"
@@ -148,9 +152,9 @@ def store_ko(path, data):
                 ["zstd", "-q", "-T0", "-%s" % level, "-f", "-o", tmp, "-"],
                 input=data, capture_output=True)
         except OSError:
-            raise RuntimeError("需要 zstd 命令来重新压缩（apt install zstd）")
+            raise RuntimeError("the zstd command is required to recompress (apt install zstd)")
         if r.returncode != 0:
-            raise RuntimeError("zstd 压缩失败：%s" % r.stderr.decode("utf-8", "replace")[:200])
+            raise RuntimeError("zstd compression failed: %s" % r.stderr.decode("utf-8", "replace")[:200])
     else:
         with open(tmp, "wb") as f:
             f.write(data)
@@ -162,7 +166,7 @@ def store_ko(path, data):
         pass
     os.replace(tmp, path)
 
-# ★ 唯一签名：从 entry 的 lea 到 ja 的完整 32 字节序列（全文件仅 1 处）
+# ★ Unique signature: the full 32-byte sequence from the entry's lea to the ja (exactly 1 occurrence in the whole file)
 SIG = bytes.fromhex(
     "8d42ff"          # lea  -0x1(%rdx),%eax
     "4156"            # push %r14
@@ -177,13 +181,13 @@ SIG = bytes.fromhex(
     "83f802"          # cmp  $0x2,%eax
     "0f87")           # ja   rel32
 
-# 补丁后的形态（用于 check/重复 apply 判定）
-SIG_NEW = (SIG[:2] + bytes([0xFE]) +        # lea -0x1 → lea -0x2
-           SIG[3:0x1D] + bytes([0x01]) +    # cmp $0x2 → cmp $0x1
+# The patched form (used by check / to decide on repeated apply)
+SIG_NEW = (SIG[:2] + bytes([0xFE]) +        # lea -0x1 -> lea -0x2
+           SIG[3:0x1D] + bytes([0x01]) +    # cmp $0x2 -> cmp $0x1
            SIG[0x1E:])
 
-OFF_LEA = 2      # lea 的 imm8 位置（字节 ff → fe）
-OFF_CMP = 0x1D   # cmp 的 imm8 位置（字节 02 → 01）
+OFF_LEA = 2      # position of the lea imm8 (byte ff -> fe)
+OFF_CMP = 0x1D   # position of the cmp imm8 (byte 02 -> 01)
 
 ORIG_LEA, NEW_LEA = 0xFF, 0xFE
 ORIG_CMP, NEW_CMP = 0x02, 0x01
@@ -210,70 +214,70 @@ def find_all(data, pat):
 def main():
     act = sys.argv[1] if len(sys.argv) > 1 else "check"
     if os.geteuid() != 0:
-        print("需要 root"); return 1
+        print("root required"); return 1
     if not KO:
-        print("找不到 nvidia.ko（也没有 .ko.zst）")
-        print("  用 TARGET_KO=/path/to/nvidia.ko 显式指定")
+        print("cannot find nvidia.ko (and no .ko.zst either)")
+        print("  pass TARGET_KO=/path/to/nvidia.ko to specify it explicitly")
         return 1
 
-    print(f"目标 {KO}")
-    print(f"格式 {'zstd 压缩（.ko.zst）' if IS_ZST else '未压缩 ELF'}")
+    print(f"target {KO}")
+    print(f"format {'zstd-compressed (.ko.zst)' if IS_ZST else 'raw ELF'}")
     print(f"md5  {md5(KO)}")
     try:
         data = load_ko(KO)
     except RuntimeError as e:
         print(f"!! {e}")
         return 1
-    print(f"解压后 {len(data):,} 字节\n")
+    print(f"decompressed size {len(data):,} bytes\n")
 
     if act == "revert":
         if not os.path.exists(BAK):
-            print(f"没有备份 {BAK}"); return 2
+            print(f"no backup {BAK}"); return 2
         shutil.copy2(BAK, KO)
-        print(f"已还原，md5 {md5(KO)}")
+        print(f"restored, md5 {md5(KO)}")
         if KO.endswith(".zst"):
-            print("  （备份也是 .zst 格式，直接覆盖，无需再压缩）")
+            print("  (the backup is also .zst, so it overwrites directly; no recompression needed)")
         return 0
 
-    # ---- 定位 ----
+    # ---- Locate ----
     orig_hits = find_all(data, SIG)
     new_hits = find_all(data, SIG_NEW)
     total = len(orig_hits) + len(new_hits)
-    print(f"签名命中：原始形态 {len(orig_hits)} 处，已补丁形态 {len(new_hits)} 处")
+    print(f"signature hits: original form {len(orig_hits)}, patched form {len(new_hits)}")
     if total != 1:
-        print("!! 签名不唯一或找不到，拒绝操作")
+        print("!! signature is not unique or not found; refusing to proceed")
         for h in orig_hits[:10]:
-            print(f"   原始 @ {h:#x}")
+            print(f"   original @ {h:#x}")
         for h in new_hits[:10]:
-            print(f"   已补丁 @ {h:#x}")
+            print(f"   patched @ {h:#x}")
         return 2
 
     already = len(new_hits) == 1
     base = new_hits[0] if already else orig_hits[0]
-    print(f"  定位到 {base:#x}  （对应 .text 节内偏移 {base - 0x40:#x}）")
+    print(f"  located at {base:#x}  (offset {base - 0x40:#x} within the .text section)")
 
     cur_lea, cur_cmp = data[base + OFF_LEA], data[base + OFF_CMP]
-    print(f"  lea imm8 @ {base + OFF_LEA:#x} = {cur_lea:#04x}   （原 {ORIG_LEA:#04x} / 补丁 {NEW_LEA:#04x}）")
-    print(f"  cmp imm8 @ {base + OFF_CMP:#x} = {cur_cmp:#04x}   （原 {ORIG_CMP:#04x} / 补丁 {NEW_CMP:#04x}）")
+    print(f"  lea imm8 @ {base + OFF_LEA:#x} = {cur_lea:#04x}   (orig {ORIG_LEA:#04x} / patched {NEW_LEA:#04x})")
+    print(f"  cmp imm8 @ {base + OFF_CMP:#x} = {cur_cmp:#04x}   (orig {ORIG_CMP:#04x} / patched {NEW_CMP:#04x})")
 
     if act == "check":
         if already:
-            print("\n[已打补丁] mode==1 会直接 bail，驱动不再把链路降回 Gen1")
-            print("  ⚠ 需重载 nvidia 模块才生效")
+            print("\n[patched] mode==1 now bails outright; the driver no longer downgrades the link to Gen1")
+            print("  ⚠ the nvidia module must be reloaded for this to take effect")
         else:
-            print("\n[未打补丁] 当前 mode==1 会写 SPEED=2 → 链路降回 2.5GT/s")
-            print("  补丁后：mode ∈ {1} → bail；{2,3} 照旧；≥4 照旧")
+            print("\n[not patched] currently mode==1 writes SPEED=2 -> the link drops back to 2.5GT/s")
+            print("  after patch: mode in {1} -> bail; {2,3} unchanged; >=4 unchanged")
         return 0
 
     if act == "apply":
         if already:
-            print("\n已打过补丁"); return 0
+            print("\nalready patched"); return 0
         if cur_lea != ORIG_LEA or cur_cmp != ORIG_CMP:
-            print(f"\n!! 字节异常（lea={cur_lea:#04x} cmp={cur_cmp:#04x}），拒绝打补丁")
+            print(f"\n!! unexpected bytes (lea={cur_lea:#04x} cmp={cur_cmp:#04x}); refusing to patch")
             return 2
         if not os.path.exists(BAK):
             shutil.copy2(KO, BAK)
-            print(f"\n已备份 → {BAK}")
+            print(f"\nbacked up -> {BAK}")
 
         nd = bytearray(data)
         nd[base + OFF_LEA] = NEW_LEA
@@ -281,20 +285,20 @@ def main():
         try:
             store_ko(KO, bytes(nd))
         except RuntimeError as e:
-            print(f"\n!! 写回失败：{e}")
+            print(f"\n!! write-back failed: {e}")
             return 2
 
-        print(f"已写入: {bytes(nd[base:base+len(SIG)]).hex(' ')}")
-        print(f"新 md5: {md5(KO)}")
+        print(f"written: {bytes(nd[base:base+len(SIG)]).hex(' ')}")
+        print(f"new md5: {md5(KO)}")
         if IS_ZST:
-            print(f"  （已按 zstd -{os.environ.get('ZSTD_LEVEL', '19')} 重新压缩）")
-        print("\n下一步：rmmod nvidia_uvm nvidia_modeset nvidia_drm nvidia → modprobe nvidia")
+            print(f"  (recompressed with zstd -{os.environ.get('ZSTD_LEVEL', '19')})")
+        print("\nnext: rmmod nvidia_uvm nvidia_modeset nvidia_drm nvidia -> modprobe nvidia")
         if IS_ZST:
-            print("⚠ DKMS 场景：模块已被改但 DKMS 缓存仍是旧的，")
-            print("   重装内核或 dkms install 会把补丁冲掉。跑 sync-dkms.sh adopt 固化。")
+            print("⚠ DKMS note: the module file is patched but the DKMS cache is still stale,")
+            print("   reinstalling the kernel or running dkms install will wipe the patch. Run sync-dkms.sh adopt to persist it.")
         return 0
 
-    print(f"未知动作 {act}")
+    print(f"unknown action {act}")
     return 1
 
 

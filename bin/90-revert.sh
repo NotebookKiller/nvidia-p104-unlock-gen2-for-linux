@@ -1,51 +1,51 @@
 #!/bin/bash
 # ============================================================
-# 90-revert.sh —— 完全回滚到原始状态
+# 90-revert.sh — roll everything back to the original state
 #
-# 回滚两件事：
-#   ① 卸载 gen2kr（守卫停止）
-#   ② 还原 nvidia.ko 到备份（去掉 2 字节补丁）
-# 然后重载驱动。
+# Rolls back two things:
+#   1. Unload gen2kr (the guard stops)
+#   2. Restore nvidia.ko from the backup (removes the 2-byte patch)
+# Then reloads the driver.
 #
-# 用法：
+# Usage:
 #   sudo bash bin/90-revert.sh --dry-run
 #   sudo bash bin/90-revert.sh
 # ============================================================
 set -u
 
 # ============================================================
-# 1. 变量
+# 1. Variables
 # ============================================================
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-DRY=0                   # 1 = 只打印计划
+DRY=0                   # 1 = print the plan only
 
-# nvidia 模块的卸载顺序（依赖关系：drm → modeset → uvm → 主模块）
+# Unload order for the nvidia modules (dependency order: drm -> modeset -> uvm -> main module)
 NVIDIA_MODULES=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
 
 # ============================================================
-# 2. 函数
+# 2. Functions
 # ============================================================
 
-# 解析参数
+# Parse arguments
 parse_args() {
     case "${1:-}" in
         --dry-run) DRY=1 ;;
         "")        ;;
         *)
-            err "未知参数 $1"
-            echo "   用法: sudo bash bin/90-revert.sh [--dry-run]"
+            err "unknown argument $1"
+            echo "   usage: sudo bash bin/90-revert.sh [--dry-run]"
             exit 2
             ;;
     esac
 }
 
-# 第一步：卸载 gen2kr
+# Step 1: unload gen2kr
 step_unload_kmod() {
-    hdr "1. 卸载 gen2kr"
+    hdr "1. Unloading gen2kr"
 
     if ! lsmod | grep -q '^gen2kr'; then
-        echo "   gen2kr 未加载"
+        echo "   gen2kr is not loaded"
         return 0
     fi
 
@@ -55,15 +55,15 @@ step_unload_kmod() {
     fi
 
     if rmmod gen2kr; then
-        ok "已卸载"
+        ok "unloaded"
     else
-        warn "rmmod 失败（可能仍被占用）"
+        warn "rmmod failed (it may still be in use)"
     fi
 }
 
-# 第二步：还原 nvidia.ko
+# Step 2: restore nvidia.ko
 step_revert_patch() {
-    hdr "2. 还原 nvidia.ko"
+    hdr "2. Restoring nvidia.ko"
 
     if [ "${DRY}" = "1" ]; then
         python3 "${PKG_ROOT}/bin/patch_no_gen1.py" check 2>&1 | sed 's/^/   /'
@@ -72,15 +72,15 @@ step_revert_patch() {
     fi
 
     python3 "${PKG_ROOT}/bin/patch_no_gen1.py" revert \
-        || warn "还原失败（可能本来就没打补丁）"
-    echo "   当前 md5 = $(md5sum "${KO}" | cut -d' ' -f1)"
+        || warn "restore failed (the patch may have never been applied)"
+    echo "   current md5 = $(md5sum "${KO}" | cut -d' ' -f1)"
 }
 
-# 第三步：重载驱动
+# Step 3: reload the driver
 step_reload() {
     local m
 
-    hdr "3. 重载驱动"
+    hdr "3. Reloading the driver"
 
     for m in "${NVIDIA_MODULES[@]}"; do
         lsmod | grep -q "^${m} " || continue
@@ -98,24 +98,24 @@ step_reload() {
     fi
 
     if modprobe nvidia && modprobe nvidia_uvm; then
-        ok "驱动已重载"
+        ok "driver reloaded"
     else
-        err "驱动重载失败"
+        err "driver reload failed"
         return 1
     fi
     sleep 2
     echo "   $(read_regs)"
 }
 
-# 结束语
+# Closing message
 show_footer() {
     echo
     echo "======================================================"
     if [ "${DRY}" = "0" ]; then
-        echo " 已回滚。链路现在应为 Gen1（$(cur_speed)）—— 这是原厂默认行为。"
-        echo " 想重新解锁：sudo bash bin/20-install.sh"
+        echo " Rolled back. The link should now be Gen1 ($(cur_speed)) -- that is the factory default behavior."
+        echo " To unlock again: sudo bash bin/20-install.sh"
     else
-        echo " dry-run 结束，未改动任何东西"
+        echo " dry-run finished; nothing was changed"
     fi
     echo "======================================================"
 }
@@ -129,8 +129,8 @@ main() {
     need_root
 
     echo "======================================================"
-    echo " 回滚"
-    [ "${DRY}" = "1" ] && echo " ${C_Y}模式：dry-run${C_0}"
+    echo " Rollback"
+    [ "${DRY}" = "1" ] && echo " ${C_Y}mode: dry-run${C_0}"
     echo "======================================================"
 
     step_unload_kmod

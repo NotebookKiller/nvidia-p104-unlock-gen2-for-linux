@@ -1,50 +1,55 @@
 #!/bin/bash
 # ============================================================
-# 20-install.sh —— 应用补丁并让链路跑到 Gen2
+# 20-install.sh — apply the patch and get the link running at Gen2
 #
-# 做两件事，顺序不能反：
-#   ① 给 nvidia.ko 打 2 字节补丁：让 _nv017105rm(mode=1) 在入口 bail
-#      ⇒ 驱动不再在每次 cuInit 时把链路降回 Gen1
-#   ② 加载 gen2kr 在 nv_pci_probe 返回瞬间解锁声明并推一次 → 链路升到 5GT/s
-#      之后补丁负责"保持"，gen2kr 的守卫退化为安全网（补丁丢失时才动手）
+# Does two things, in this order (cannot be swapped):
+#   1. Patch nvidia.ko with 2 bytes: make _nv017105rm(mode=1) bail at entry
+#      => the driver no longer drops the link back to Gen1 on every cuInit
+#   2. Load gen2kr so it unlocks the endpoint announcement the instant
+#      nv_pci_probe returns and pushes once => the link rises to 5GT/s
+#      Afterwards the patch does the "holding"; the gen2kr guard degrades to a
+#      safety net (it only acts if the patch is lost)
 #
-# ★ 什么时候需要重载 nvidia，什么时候不需要：
-#   · 刚 apply 过补丁 ⇒ **必须重载**（改的是 .ko 文件，不重载读的还是旧代码）
-#   · 补丁早就在 .ko 里（例如重启后）⇒ **不必重载**，只要让设备重新 probe 一次
-#   后者用 bin/push.sh 更快、更轻。本脚本会自动判断。
+# ★ When to reload nvidia and when not to:
+#   · Just applied the patch => **must reload** (the .ko file changed; without a
+#     reload the old code is still what runs)
+#   · The patch was already in the .ko (e.g. after a reboot) => **no reload
+#     needed**, just re-probe the device once
+#   The latter case is faster and lighter via bin/push.sh. This script decides
+#   automatically.
 #
-# 用法：
-#   sudo bash bin/20-install.sh --dry-run     # 只打印计划，不改任何东西
-#   sudo bash bin/20-install.sh               # 执行（自动决定是否重载）
-#   sudo bash bin/20-install.sh --no-patch    # 不打补丁，只加载 gen2kr（旧方案）
-#   sudo bash bin/20-install.sh --no-kmod     # 只打补丁（用于已解锁过的场景）
-#   sudo bash bin/20-install.sh --no-reload   # 强制不重载 nvidia（同 push.sh）
+# Usage:
+#   sudo bash bin/20-install.sh --dry-run     # print the plan only, change nothing
+#   sudo bash bin/20-install.sh               # execute (decides whether to reload)
+#   sudo bash bin/20-install.sh --no-patch    # skip the patch, only load gen2kr (old approach)
+#   sudo bash bin/20-install.sh --no-kmod     # patch only (for an already-unlocked setup)
+#   sudo bash bin/20-install.sh --no-reload   # force no nvidia reload (same as push.sh)
 # ============================================================
 set -u
 
 # ============================================================
-# 1. 变量
+# 1. Variables
 # ============================================================
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-# 命令行选项
-DRY=0                   # 1 = 只打印计划
-DO_PATCH=1              # 0 = 跳过补丁（--no-patch）
-DO_KMOD=1               # 0 = 跳过 gen2kr（--no-kmod）
-FORCE_NO_RELOAD=0       # 1 = 强制不重载（--no-reload）
+# Command-line options
+DRY=0                   # 1 = print the plan only
+DO_PATCH=1              # 0 = skip the patch (--no-patch)
+DO_KMOD=1               # 0 = skip gen2kr (--no-kmod)
+FORCE_NO_RELOAD=0       # 1 = force no reload (--no-reload)
 
-# 运行时状态
-PATCH_CHANGED=0         # 1 = 本次真的改了 .ko
-DO_RELOAD=0             # 1 = 需要重载 nvidia
+# Runtime state
+PATCH_CHANGED=0         # 1 = the .ko was actually changed this run
+DO_RELOAD=0             # 1 = nvidia needs a reload
 
-# nvidia 模块的卸载顺序（依赖关系：drm → modeset → uvm → 主模块）
+# Unload order for the nvidia modules (dependency order: drm -> modeset -> uvm -> main module)
 NVIDIA_MODULES=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
 
 # ============================================================
-# 2. 函数
+# 2. Functions
 # ============================================================
 
-# 执行命令；dry-run 下只打印
+# Run a command; under dry-run only print it
 run() {
     if [ "${DRY}" = "1" ]; then
         echo "   ${C_Y}[dry-run]${C_0} $*"
@@ -54,7 +59,7 @@ run() {
     fi
 }
 
-# 解析命令行参数
+# Parse command-line arguments
 parse_args() {
     local a
     for a in "$@"; do
@@ -64,62 +69,64 @@ parse_args() {
             --no-kmod)   DO_KMOD=0 ;;
             --no-reload) FORCE_NO_RELOAD=1 ;;
             *)
-                err "未知参数 ${a}"
-                echo "   可用: --dry-run --no-patch --no-kmod --no-reload"
+                err "unknown option ${a}"
+                echo "   available: --dry-run --no-patch --no-kmod --no-reload"
                 exit 2
                 ;;
         esac
     done
 }
 
-# 前置检查：驱动、设备、MMIO、探针、是否锁死
+# Pre-checks: driver, device, MMIO, probe, whether the device is wedged
 precheck() {
-    hdr "0. 前置检查"
+    hdr "0. Pre-checks"
 
-    [ -f "${KO}" ] || { err "找不到 ${KO}"; return 1; }
-    ok "驱动 ${KO}"
+    [ -f "${KO}" ] || { err "cannot find ${KO}"; return 1; }
+    ok "driver ${KO}"
 
-    lspci -Dn | grep -q '10de:1b87' || { err "找不到 P104-100"; return 1; }
-    ok "设备在总线"
+    lspci -Dn | grep -q '10de:1b87' || { err "no P104-100 found"; return 1; }
+    ok "device present on the bus"
 
     if alive; then
-        ok "MMIO 应答"
+        ok "MMIO responding"
     else
-        err "MMIO 无应答 —— 设备可能已 ZOMBIE，先整机重启"
-        echo "     判定工具：python3 bin/linkcap-audit.py"
+        err "MMIO not responding -- the device may already be ZOMBIE; reboot the whole machine first"
+        echo "     verdict tool: python3 bin/linkcap-audit.py"
         return 1
     fi
 
-    ensure_build check || { err "探针未编译 → bash bin/build.sh"; return 1; }
+    ensure_build check || { err "probe not compiled -> bash bin/build.sh"; return 1; }
 
-    # ★ 状态污染预检
-    # 不能只看 "CAP2=0x0002 + TLS=1 + Gen1" —— 那是**原厂未解锁**的正常样子。
-    # 锁死态的特征是「写过解锁位但没生效」，用 is_stuck 判断。
+    # ★ Stuck-state pre-check
+    # Do not just look at "CAP2=0x0002 + TLS=1 + Gen1" -- that is the **normal,
+    # factory-locked** appearance.
+    # A wedged state is characterized by "unlock bits were written but never took
+    # effect"; use is_stuck to decide.
     if is_stuck; then
-        warn "疑似锁死态（解锁位已置位、CAP2 仍 0x0002、链路仍 Gen1，已连续观测 3 次）"
-        echo "     判据：0x8841C=$(printf '0x%08x' "$(_r 0x8841C)")（bit15/13/11 已置位）"
-        echo "     ${C_Y}这只是提示，不阻断流程${C_0}：紧接着的推送仍可能成功。"
-        echo "     只有推送之后 CAP2 仍恒 0x0002 且链路仍 Gen1，才算真锁死"
-        echo "     （那种情况实测无法自愈：unbind/bind ×6、重训 ×13、重写 TLS ×20 全失败，"
-        echo "       只能整机重启）。"
+        warn "suspected wedged state (unlock bits set, CAP2 still 0x0002, link still Gen1, observed 3 times in a row)"
+        echo "     criteria: 0x8841C=$(printf '0x%08x' "$(_r 0x8841C)") (bits 15/13/11 set)"
+        echo "     ${C_Y}this is advisory only; it does not block the flow${C_0}: the push right after may still succeed."
+        echo "     Only if CAP2 stays pinned at 0x0002 after the push AND the link stays Gen1 is it a true wedged state"
+        echo "     (that case is measurably incurable: unbind/bind x6, retrain x13, TLS rewrite x20 all failed,"
+        echo "       the only fix is a full reboot)."
     fi
     return 0
 }
 
-# 第一步：打 2 字节补丁，并记录 .ko 是否真的变了
+# Step 1: apply the 2-byte patch, and record whether the .ko actually changed
 step_patch() {
     local before after
 
     if [ "${DO_PATCH}" != "1" ]; then
-        hdr "1. 跳过补丁（--no-patch）"
+        hdr "1. Skipping patch (--no-patch)"
         return 0
     fi
 
-    hdr "1. 应用 2 字节补丁"
-    echo "   目标：_nv017105rm 入口的 mode 范围检查"
-    echo "     127d66: lea -0x1(%rdx),%eax   →  lea -0x2(%rdx),%eax"
-    echo "     127d81: cmp \$0x2,%eax         →  cmp \$0x1,%eax"
-    echo "   效果：mode==1（Gen1）在入口直接 bail；mode 2/3 正常；≥4 与原逻辑等价"
+    hdr "1. Applying the 2-byte patch"
+    echo "   target: the mode range check at the entry of _nv017105rm"
+    echo "     127d66: lea -0x1(%rdx),%eax   ->  lea -0x2(%rdx),%eax"
+    echo "     127d81: cmp \$0x2,%eax         ->  cmp \$0x1,%eax"
+    echo "   effect: mode==1 (Gen1) bails right at entry; modes 2/3 normal; >=4 equivalent to the original"
 
     if [ "${DRY}" = "1" ]; then
         python3 "${PKG_ROOT}/bin/patch_no_gen1.py" check 2>&1 | sed 's/^/   /'
@@ -128,19 +135,19 @@ step_patch() {
     fi
 
     before="$(md5sum "${KO}" | cut -d' ' -f1)"
-    python3 "${PKG_ROOT}/bin/patch_no_gen1.py" apply || { err "补丁失败"; return 1; }
+    python3 "${PKG_ROOT}/bin/patch_no_gen1.py" apply || { err "patch failed"; return 1; }
     after="$(md5sum "${KO}" | cut -d' ' -f1)"
 
     if [ "${before}" != "${after}" ]; then
         PATCH_CHANGED=1
-        ok "补丁是新写入的 ⇒ 需要重载 nvidia 才生效"
+        ok "patch was freshly written => a reload of nvidia is required for it to take effect"
     else
-        ok "补丁本来就在（.ko 未变）⇒ 不需要重载"
+        ok "patch was already in place (.ko unchanged) => no reload needed"
     fi
     return 0
 }
 
-# 决定是否需要重载
+# Decide whether a reload is needed
 decide_reload() {
     DO_RELOAD=0
 
@@ -149,26 +156,26 @@ decide_reload() {
     elif [ "${PATCH_CHANGED}" = "1" ]; then
         DO_RELOAD=1
     elif [ "${DRY}" = "1" ] && [ "${DO_PATCH}" = "1" ]; then
-        # dry-run 下不知道会不会改，按"可能要重载"展示
+        # under dry-run we cannot know whether it will change; show it as "may need a reload"
         DO_RELOAD=1
     fi
 }
 
-# 第二步：视情况重载 nvidia
+# Step 2: reload nvidia when needed
 step_reload() {
     local m
 
     if [ "${DO_RELOAD}" != "1" ]; then
-        hdr "2. 不重载 nvidia（补丁已在 .ko 里，无需重载）"
+        hdr "2. Not reloading nvidia (the patch is already in the .ko; no reload needed)"
         if lsmod | grep -q '^nvidia '; then
-            ok "nvidia 保持加载中"
+            ok "nvidia stays loaded"
             return 0
         fi
-        err "nvidia 未加载 —— 请先 modprobe nvidia"
+        err "nvidia is not loaded -- run modprobe nvidia first"
         return 1
     fi
 
-    hdr "2. 重载 nvidia 驱动（让新写入的补丁生效）"
+    hdr "2. Reloading the nvidia driver (to make the freshly written patch take effect)"
 
     if lsmod | grep -q '^gen2kr'; then
         run "rmmod gen2kr"
@@ -182,12 +189,12 @@ step_reload() {
     sleep 1
 
     if [ "${DRY}" = "0" ] && lsmod | grep -qE '^nvidia'; then
-        err "nvidia 未能卸载，检查占用："
+        err "nvidia could not be unloaded; check who holds it:"
         echo "     fuser -v /dev/nvidia* 2>/dev/null"
-        echo "     （Xorg / nvitop / 任何 CUDA 进程都会占住）"
+        echo "     (Xorg / nvitop / any CUDA process will hold it)"
         return 1
     fi
-    [ "${DRY}" = "0" ] && ok "已卸干净"
+    [ "${DRY}" = "0" ] && ok "fully unloaded"
 
     run "modprobe nvidia"
     run "modprobe nvidia_uvm"
@@ -195,45 +202,47 @@ step_reload() {
     return 0
 }
 
-# 检查是否有进程占用 GPU
+# Check whether any process is holding the GPU
 #
-# ★ 2026-10-29 事故：GPU 被浏览器占用时写 unbind 不会失败、也不会返回，
-#   而是卡在 device_release_driver_internal 里，进程落入 D/R 状态、
-#   kill -9 无效，只能整机重启。所以这一步是硬阻断，不是警告。
+# ★ 2026-10-29 incident: when the GPU is held by a browser, writing unbind does not
+#   fail and does not return either -- it wedges inside device_release_driver_internal,
+#   processes land in D/R state, kill -9 is useless, and only a full reboot helps.
+#   That is why this step is a hard block, not a warning.
 check_gpu_idle() {
     local holders
 
     holders="$(fuser /dev/nvidia* 2>/dev/null | tr -s ' ')"
     [ -z "${holders}" ] && return 0
 
-    err "有进程正在使用 GPU，unbind 会卡死内核（只能重启）"
-    echo "     占用者："
+    err "a process is using the GPU; unbind would wedge the kernel (reboot only)"
+    echo "     holders:"
     fuser -v /dev/nvidia* 2>&1 | sed 's/^/       /'
     echo
-    echo "     请先关掉这些程序（浏览器 / Electron 应用最常见），然后重试。"
-    echo "     ⚠ 实测 unbind 会停在 device_lock 不动，进程落入 D 状态、kill -9 无效。"
+    echo "     close these programs first (browsers / Electron apps are the usual culprits), then retry."
+    echo "     ⚠ measured: unbind stops dead in device_lock; processes land in D state and kill -9 does nothing."
     return 1
 }
 
-# 第三步：加载 gen2kr 并触发一次 probe
+# Step 3: load gen2kr and trigger one probe
 step_push() {
     if [ "${DO_KMOD}" != "1" ]; then
-        hdr "3. 跳过 gen2kr（--no-kmod）"
+        hdr "3. Skipping gen2kr (--no-kmod)"
         return 0
     fi
 
-    hdr "3. 加载 gen2kr 并触发一次 probe"
-    echo "   它在 nv_pci_probe 上挂 kretprobe，在 probe 返回的瞬间："
-    echo "     ① 解锁端点声明（XP3G + 0x8841C + 0x88610）使 LCAP2 → 0x06"
-    echo "     ② 写 0x8C040.SPEED=1（5.0GT/s）"
-    echo "     ③ 两端 TLS=2，从根端口 Retrain"
+    hdr "3. Loading gen2kr and triggering one probe"
+    echo "   it attaches a kretprobe to nv_pci_probe; the instant the probe returns it:"
+    echo "     1. unlocks the endpoint announcement (XP3G + 0x8841C + 0x88610) so LCAP2 -> 0x06"
+    echo "     2. writes 0x8C040.SPEED=1 (5.0GT/s)"
+    echo "     3. sets TLS=2 on both ends and retrains from the root port"
 
-    # ★ 真正执行前必须确认 GPU 空闲
+    # ★ Before actually executing, the GPU must be confirmed idle
     if [ "${DRY}" = "0" ]; then
         check_gpu_idle || return 1
     fi
 
-    # 已在内存里就先卸掉，清掉 triggered 标志（否则 push 不会再触发）
+    # If already in memory, unload it first to clear the triggered flag
+    # (otherwise the push will not trigger again)
     if lsmod | grep -q '^gen2kr'; then
         run "rmmod gen2kr 2>/dev/null || true"
         [ "${DRY}" = "0" ] && sleep 1
@@ -247,28 +256,28 @@ step_push() {
 
     [ "${DRY}" = "1" ] && return 0
 
-    echo "   等待链路升到 Gen2（最多 20s）..."
+    echo "   waiting for the link to rise to Gen2 (up to 20s)..."
     if wait_gen2 20; then
-        ok "链路 = Gen2    $(read_regs)"
+        ok "link = Gen2    $(read_regs)"
         return 0
     fi
 
-    warn "push 未成功（$(read_regs)）"
-    echo "     gen2kr 日志："
+    warn "push did not succeed ($(read_regs))"
+    echo "     gen2kr log:"
     dmesg | grep -i gen2kr | tail -8 | sed 's/^/       /'
     echo
-    echo "     若守卫正在自动重试，再等 25s；仍不行则参考 docs/故障排查.md"
+    echo "     if the guard is auto-retrying, wait another 25s; if it still fails see docs/troubleshooting.md"
     return 0
 }
 
-# 第四步：汇总结果
+# Step 4: summarize the result
 show_result() {
     local regs
 
-    hdr "4. 结果"
+    hdr "4. Result"
 
     if [ "${DRY}" = "1" ]; then
-        echo "   ${C_Y}dry-run 结束，未改动任何东西${C_0}"
+        echo "   ${C_Y}dry-run finished; nothing was changed${C_0}"
         return 0
     fi
 
@@ -276,17 +285,17 @@ show_result() {
     echo "   ${regs}"
 
     if is_gen2; then
-        ok "链路已是 Gen2"
+        ok "link is already at Gen2"
         echo
-        echo "   下一步：sudo bash bin/30-verify.sh    （验证带宽 + 补丁是否真的接管）"
+        echo "   next step: sudo bash bin/30-verify.sh    (verify bandwidth + that the patch really took over)"
         return 0
     fi
 
-    err "链路仍是 Gen1"
-    echo "   可能原因："
-    echo "     1. 设备处于驱动侧锁死态 → 整机重启后重试"
-    echo "     2. gen2kr push 失败 → dmesg | grep gen2kr"
-    echo "     3. 声明未解锁 → CAP2 应为 0x0006，当前 $(cap2)"
+    err "link is still at Gen1"
+    echo "   possible causes:"
+    echo "     1. the device is in a driver-side wedged/stuck state -> reboot the machine and retry"
+    echo "     2. the gen2kr push failed -> dmesg | grep gen2kr"
+    echo "     3. the announcement was not unlocked -> CAP2 should be 0x0006, currently $(cap2)"
 }
 
 # ============================================================
@@ -298,8 +307,8 @@ main() {
     need_root
 
     echo "======================================================"
-    echo " 安装 PCIe Gen2 解锁"
-    [ "${DRY}" = "1" ] && echo " ${C_Y}模式：dry-run（不会改动任何东西）${C_0}"
+    echo " Installing the PCIe Gen2 unlock"
+    [ "${DRY}" = "1" ] && echo " ${C_Y}mode: dry-run (nothing will be changed)${C_0}"
     echo "======================================================"
 
     precheck   || exit 1
@@ -308,7 +317,7 @@ main() {
     decide_reload
     step_reload || exit 1
 
-    [ "${DRY}" = "0" ] && ok "当前：$(read_regs)"
+    [ "${DRY}" = "0" ] && ok "current: $(read_regs)"
 
     step_push    || exit 1
     show_result

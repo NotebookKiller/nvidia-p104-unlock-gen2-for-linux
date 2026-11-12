@@ -1,5 +1,5 @@
-# 只编译 gen2kr
-# （gen2kp.c / gen2hw.c 是早期实验版本，放在 legacy/ 里，不参与编译）
+# Build gen2kr only
+# (gen2kp.c / gen2hw.c are early experimental versions, kept in legacy/ and not built)
 obj-m := gen2kr.o
 
 KDIR := /lib/modules/$(shell uname -r)/build

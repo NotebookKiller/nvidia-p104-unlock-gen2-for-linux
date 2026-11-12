@@ -1,47 +1,48 @@
 #!/bin/bash
 # ============================================================
-# 10-check.sh —— 环境自检（★ 纯只读，不改动任何东西）
+# 10-check.sh — environment self-check (★ strictly read-only, changes nothing)
 #
-# 在动手之前跑这个，确认：
-#   设备在、驱动版本对、补丁工具能定位、探针能跑、寄存器状态是什么
+# Run this before touching anything to confirm:
+#   the device is present, the driver version is right, the patcher can
+#   locate its target, the probes run, and what the register state is
 #
-# 用法：
+# Usage:
 #   sudo bash bin/10-check.sh
 # ============================================================
 set -u
 
 # ============================================================
-# 1. 变量
+# 1. Variables
 # ============================================================
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-# gen2kr 可调参数（有则显示）
+# gen2kr tunable parameters (shown when present)
 GEN2KR_PARAMS=(guard_period_ms debounce_cnt retrain_min_ms speed_settle_ms stage_gap_ms)
 
 # ============================================================
-# 2. 函数
+# 2. Functions
 # ============================================================
 
-# 检查系统信息
+# System information
 check_system() {
-    hdr "1. 系统"
-    echo "  内核      : ${KVER}"
-    echo "  发行版    : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)"
-    echo "  当前用户  : $(id -un) (uid $(id -u))"
+    hdr "1. System"
+    echo "  Kernel       : ${KVER}"
+    echo "  Distribution : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)"
+    echo "  Current user : $(id -un) (uid $(id -u))"
 }
 
-# 检查 nvidia 驱动文件与加载状态
+# nvidia driver file and load state
 check_driver() {
-    hdr "2. nvidia 驱动"
+    hdr "2. nvidia driver"
 
     if [ -f "${KO}" ]; then
         ok "${KO}"
         echo "     md5 = $(md5sum "${KO}" | cut -d' ' -f1)"
-        echo "     大小 = $(stat -c%s "${KO}")"
+        echo "     size = $(stat -c%s "${KO}")"
     else
-        err "找不到 ${KO}"
-        echo "     期望路径：/lib/modules/${KVER}/updates/dkms/nvidia.ko"
-        echo "     若驱动装在别处，请修改 bin/_common.sh 里的 KO"
+        err "Cannot find ${KO}"
+        echo "     Expected path: /lib/modules/${KVER}/updates/dkms/nvidia.ko"
+        echo "     If the driver lives elsewhere, adjust KO in bin/_common.sh"
     fi
 
     if [ -r /proc/driver/nvidia/version ]; then
@@ -49,103 +50,103 @@ check_driver() {
     fi
 
     if lsmod | grep -qE '^nvidia'; then
-        lsmod | grep -E '^nvidia' | sed 's/^/     已加载: /'
+        lsmod | grep -E '^nvidia' | sed 's/^/     loaded: /'
     else
-        echo "     nvidia 未加载"
+        echo "     nvidia not loaded"
     fi
 }
 
-# 检查设备是否在总线、链路当前状态
+# Device present on the bus, current link state
 check_device() {
-    hdr "3. 设备"
+    hdr "3. Device"
 
     if lspci -Dn 2>/dev/null | grep -q '10de:1b87'; then
-        ok "P104-100 (10de:1b87) 在总线"
+        ok "P104-100 (10de:1b87) on the bus"
         lspci -vv -s "${DEV_SHORT}" 2>/dev/null | grep -o 'LnkSta:.*' | sed 's/^/     /'
         echo "     cfg = $(setpci -s "${DEV_SHORT}" 0.l 2>&1)"
     else
-        err "找不到 P104-100"
-        lspci -Dn | grep -i 10de | sed 's/^/     /' || echo "     （无 NVIDIA 设备）"
+        err "Cannot find P104-100"
+        lspci -Dn | grep -i 10de | sed 's/^/     /' || echo "     (no NVIDIA devices)"
     fi
 }
 
-# 只读检查关键寄存器（唯一可信判据）
+# Read-only check of the key registers (the only trustworthy verdict)
 check_registers() {
-    hdr "4. 寄存器（唯一可信判据）"
+    hdr "4. Registers (the only trustworthy verdict)"
     echo "     $(read_regs)"
-    echo "     ↑ LNKSTA=2 才算 Gen2；CAP2=0x0006 才算声明已解锁"
+    echo "     ↑ LNKSTA=2 means Gen2; CAP2=0x0006 means the declaration is unlocked"
 
     if alive; then
-        ok "MMIO 应答正常"
+        ok "MMIO responding normally"
     else
-        err "MMIO 连续 20 次 0xffffffff —— 设备可能 ZOMBIE"
+        err "MMIO read 0xffffffff 20 times in a row — the device may be a ZOMBIE"
     fi
 }
 
-# 检查补丁工具能否在该版本 .ko 上唯一定位
+# Can the patch tool uniquely locate its target on this .ko version
 check_patch_locator() {
-    hdr "5. 补丁工具能否定位目标"
+    hdr "5. Patch tool target location"
     [ -f "${KO}" ] || return 0
     python3 "${PKG_ROOT}/bin/patch_no_gen1.py" check 2>&1 | sed 's/^/     /'
 }
 
-# 检查探针是否编译好
+# Are the probes built
 check_probes() {
-    hdr "6. 探针"
+    hdr "6. Probes"
 
     if ensure_build check >/dev/null 2>&1; then
-        ok "build/ 探针已就绪"
+        ok "probes in build/ are ready"
     else
-        warn "build/ 探针缺失 → 先跑 bin/build.sh"
+        warn "probes missing in build/ -> run bin/build.sh first"
     fi
 
     if [ -f "${BUILD_DIR}/gen2kr.ko" ]; then
-        ok "build/gen2kr.ko 已就绪"
+        ok "build/gen2kr.ko is ready"
     else
-        warn "build/gen2kr.ko 缺失 → 先跑 bin/build.sh"
+        warn "build/gen2kr.ko missing -> run bin/build.sh first"
     fi
 
     if [ -n "${KMOD_DIR}" ]; then
-        ok "模块源码目录 ${KMOD_DIR#${PKG_ROOT}/}"
+        ok "module source directory ${KMOD_DIR#${PKG_ROOT}/}"
     else
-        warn "找不到内核模块源码目录（drivers/*/kernel/*/）"
+        warn "cannot find the kernel module source directory (drivers/*/kernel/*/)"
     fi
 }
 
-# 检查 gen2kr 当前加载状态与参数
+# gen2kr current load state and parameters
 check_gen2kr_state() {
     local p
 
-    hdr "7. 当前 gen2kr 状态"
+    hdr "7. Current gen2kr state"
 
     if ! lsmod | grep -q '^gen2kr'; then
-        echo "     gen2kr 未加载"
+        echo "     gen2kr not loaded"
         return 0
     fi
 
-    warn "gen2kr 已加载（守卫在运行）"
+    warn "gen2kr loaded (guard is running)"
     for p in "${GEN2KR_PARAMS[@]}"; do
         printf '     %-16s = %s\n' "$p" \
             "$(cat "/sys/module/gen2kr/parameters/${p}" 2>/dev/null || echo N/A)"
     done
 }
 
-# 检查已知干扰源
+# Known interference sources
 check_interference() {
-    hdr "8. 干扰源检查"
+    hdr "8. Interference check"
 
     if pgrep -x nvitop >/dev/null 2>&1; then
-        err "检测到 nvitop —— 它曾用 Xid 79 打死过设备，且占 /dev/nvidia* 使 rmmod EBUSY"
+        err "nvitop detected — it once killed a device through Xid 79, and holding /dev/nvidia* makes rmmod return EBUSY"
     else
-        ok "无 nvitop"
+        ok "no nvitop"
     fi
 
     if pgrep -x Xorg >/dev/null 2>&1; then
-        warn "Xorg 在运行（会持有 /dev/nvidia*，rmmod 可能 EBUSY）"
+        warn "Xorg is running (holds /dev/nvidia*, rmmod may return EBUSY)"
     fi
 }
 
-# 总结当前链路状态
+# Summarize the current link state
 show_summary() {
     local speed
 
@@ -154,11 +155,11 @@ show_summary() {
     echo
     echo "======================================================"
     if [ "${speed}" = "2" ]; then
-        echo " 当前状态：${C_G}链路已是 Gen2${C_0}"
+        echo " Current state: ${C_G}link is already Gen2${C_0}"
     else
-        echo " 当前状态：链路 Gen$([ "${speed}" = "1" ] && echo 1 || echo '?')，需要解锁"
+        echo " Current state: link Gen$([ "${speed}" = "1" ] && echo 1 || echo '?'), unlock needed"
     fi
-    echo " 下一步  ：sudo bash bin/20-install.sh --dry-run   先看计划"
+    echo " Next step  : sudo bash bin/20-install.sh --dry-run   to preview the plan first"
     echo "======================================================"
 }
 
@@ -167,7 +168,7 @@ show_summary() {
 # ============================================================
 main() {
     echo "======================================================"
-    echo " NVIDIA P104-100 PCIe Gen2 解锁 —— 环境自检"
+    echo " NVIDIA P104-100 PCIe Gen2 unlock — environment self-check"
     echo "======================================================"
 
     check_system

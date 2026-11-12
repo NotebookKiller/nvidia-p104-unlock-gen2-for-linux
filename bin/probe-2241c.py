@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""probe-2241c.py —— 只读验证 skbskhud 报告里提到、我们没碰过的两个寄存器语义
+"""probe-2241c.py — read-only verification of two register semantics mentioned in
+skbskhud's report that we never touched
 
-## 背景
-`skbskhud/p104-gen2-unlock`（Windows 工具）的技术报告声称：
+## Background
+The technical report of `skbskhud/p104-gen2-unlock` (a Windows tool) claims:
 
-  · `0x8841C` bit15 = **"复位前置值"**：复位前置 1 → 复位后声明锁存为 Gen2（7/7 无反例）
-  · `0x8841C` bit14:13 = 降级门（== 3 强制降回 Gen1）
-  · `0x2241C` = `PUNITS.PCI`，**bit7 是 live 的 Gen1/Gen2 选择器**
-      写 0 立刻降 Gen1，写 1 立刻回 Gen2，**无需复位**
-  · `LNKCAP2` 在 Gen2 稳态应为 `0x06`，`0x2241C` 应为 `0x81`
+  · `0x8841C` bit15 = **"reset pre-set value"**: preset 1 -> after reset the
+    declaration latches as Gen2 (7/7, no counterexample)
+  · `0x8841C` bit14:13 = the downgrade gate (== 3 forces back to Gen1)
+  · `0x2241C` = `PUNITS.PCI`, **bit7 is a live Gen1/Gen2 selector**
+      writing 0 drops to Gen1 immediately, writing 1 returns to Gen2 immediately,
+      **no reset needed**
+  · In the Gen2 steady state `LNKCAP2` should be `0x06` and `0x2241C` should be
+    `0x81`
 
-我们的方案从来没碰过 `0x2241C`，也没搞清 `0x8841C` bit15 的语义 ——
-只知道"置了它"，不知道为什么。
+Our approach never touched `0x2241C`, and we never figured out the semantics of
+`0x8841C` bit15 -- we only knew "we set it", not why.
 
-## 本脚本做什么
-**纯只读。** 打印这些位置在我们卡上的实际值，用来交叉验证他的结论是否成立。
-不写任何寄存器（写 `0x2241C` bit7=0 会立刻把链路降到 Gen1，风险不值得冒）。
+## What this script does
+**Purely read-only.** It prints the actual values of these locations on our
+cards, to cross-check whether his conclusions hold. It writes no registers
+(writing `0x2241C` bit7=0 would instantly drop the link to Gen1; the risk is not
+worth it).
 
-用法：sudo python3 probe-2241c.py
+Usage: sudo python3 probe-2241c.py
 """
 import mmap
 import os
@@ -27,13 +33,13 @@ import sys
 DEV_RES = "/sys/bus/pci/devices/%s/resource" % os.environ.get("DEV_BDF", "0000:01:00.0")
 
 REGS = [
-    (0x88084, "LNKCAP ", "最大速率声明 (bits[3:0])"),
-    (0x880A4, "LNKCAP2", "支持速率向量 (0x06=Gen1+Gen2 已锁存)"),
-    (0x88088, "LNKSTA ", "当前速率 (bits[19:16])"),
-    (0x880A8, "LNKCTL2", "目标速率 (bits[3:0]) ← 他说这是「温度计不是开关」"),
-    (0x8841C, "CONFIG ", "能力生成器输入：bit15=复位前置, bit14:13=降级门"),
-    (0x2241C, "PUNITS.PCI", "★ live Gen1/Gen2 选择器 (bit7) —— 我们没碰过"),
-    (0x8872C, "LTSSM  ", "触发训练（写 6）"),
+    (0x88084, "LNKCAP ", "max-speed declaration (bits[3:0])"),
+    (0x880A4, "LNKCAP2", "supported-speed vector (0x06=Gen1+Gen2 latched)"),
+    (0x88088, "LNKSTA ", "current speed (bits[19:16])"),
+    (0x880A8, "LNKCTL2", "target speed (bits[3:0]) <- he calls this 'a thermometer, not a switch'"),
+    (0x8841C, "CONFIG ", "capability generator input: bit15=reset preset, bit14:13=downgrade gate"),
+    (0x2241C, "PUNITS.PCI", "★ live Gen1/Gen2 selector (bit7) -- we never touched this"),
+    (0x8872C, "LTSSM  ", "trigger training (write 6)"),
     (0x8C040, "LINKCFG0", "SPEED=bits[19:18] (1=5GT/s, 2=2.5GT/s)"),
     (0x8C2C0, "CYA_0  ", "bit2 = DIS_G2"),
 ]
@@ -41,11 +47,11 @@ REGS = [
 
 def main():
     if os.geteuid() != 0:
-        print("需要 root"); return 1
+        print("root required"); return 1
     try:
         p = int(open(DEV_RES).readline().split()[0], 16)
     except Exception as e:
-        print(f"取不到 BAR0: {e}"); return 1
+        print(f"cannot get BAR0: {e}"); return 1
 
     f = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
     m = mmap.mmap(f, 0x1000000, mmap.MAP_SHARED, mmap.PROT_READ, offset=p)
@@ -53,7 +59,7 @@ def main():
 
     print(f"BAR0 = 0x{p:x}\n")
     print("=" * 76)
-    print(" 寄存器实际值（只读）")
+    print(" actual register values (read-only)")
     print("=" * 76)
     for off, name, desc in REGS:
         v = g(off)
@@ -69,24 +75,24 @@ def main():
 
     print()
     print("=" * 76)
-    print(" 关键位交叉验证（对照 skbskhud 的说法）")
+    print(" cross-checking the key bits (against skbskhud's claims)")
     print("=" * 76)
 
     cfg = g(0x8841C)
     b15 = (cfg >> 15) & 1
     gate = (cfg >> 13) & 3
     print(f"\n  0x8841C = 0x{cfg:08x}")
-    print(f"    bit15 (他称「复位前置值」)      = {b15}")
-    print(f"    bit14:13 (他称「降级门」)        = {gate}  "
-          f"{'← ==3，按他说的会强制降 Gen1' if gate == 3 else '← 不是 3，不强制降级'}")
+    print(f"    bit15 (his 'reset pre-set value')      = {b15}")
+    print(f"    bit14:13 (his 'downgrade gate')        = {gate}  "
+          f"{'<- ==3; per his claim this forces Gen1' if gate == 3 else '<- not 3; no forced downgrade'}")
 
     pu = g(0x2241C)
     b7 = (pu >> 7) & 1
     b0 = pu & 1
     print(f"\n  0x2241C = 0x{pu:08x}")
-    print(f"    bit7 (他称「live Gen1/Gen2 选择器」) = {b7}   "
-          f"{'← 1 = FULL，与当前 Gen2 链路一致' if b7 else '← 0，与他说的 Gen2 稳态(0x81)不符'}")
-    print(f"    bit0 (PCIE_VERSION)                 = {b0}   "
+    print(f"    bit7 (his 'live Gen1/Gen2 selector') = {b7}   "
+          f"{'<- 1 = FULL, consistent with the current Gen2 link' if b7 else '<- 0, inconsistent with his Gen2 steady state (0x81)'}")
+    print(f"    bit0 (PCIE_VERSION)                  = {b0}   "
           f"{'= v2' if b0 else '= v1'}")
 
     cap2 = g(0x880A4)
@@ -95,32 +101,33 @@ def main():
 
     print()
     print("=" * 76)
-    print(" 判读")
+    print(" verdict")
     print("=" * 76)
     ok = True
     if cap2 == 0x06:
-        print("  ✓ LNKCAP2 = 0x06 —— 声明已锁存为 Gen2，与他的描述一致")
+        print("  ✓ LNKCAP2 = 0x06 -- the declaration has latched as Gen2, matching his description")
     else:
-        print(f"  · LNKCAP2 = 0x{cap2:04x} —— 当前不是 Gen2 稳态")
+        print(f"  · LNKCAP2 = 0x{cap2:04x} -- not in the Gen2 steady state")
         ok = False
     if cur == 2:
-        print("  ✓ LNKSTA = 2 —— 链路确实跑在 5.0GT/s")
+        print("  ✓ LNKSTA = 2 -- the link really runs at 5.0GT/s")
     else:
-        print(f"  · LNKSTA = {cur} —— 链路不在 Gen2")
+        print(f"  · LNKSTA = {cur} -- the link is not at Gen2")
         ok = False
     if b7 == 1:
-        print("  ✓ 0x2241C bit7 = 1 —— 印证他「live 选择器」的说法（Gen2 稳态）")
+        print("  ✓ 0x2241C bit7 = 1 -- confirms his 'live selector' claim (Gen2 steady state)")
     else:
-        print("  ? 0x2241C bit7 = 0 —— 与他说的 Gen2 稳态不符，值得深究")
+        print("  ? 0x2241C bit7 = 0 -- inconsistent with his Gen2 steady state; worth digging into")
     if gate != 3:
-        print(f"  ✓ 降级门 = {gate}（非 3）—— 没有处于强制降级状态")
+        print(f"  ✓ downgrade gate = {gate} (not 3) -- not in a forced-downgrade state")
     else:
-        print("  ⚠ 降级门 = 3 —— 处于强制降 Gen1 状态，但链路仍是 Gen2，矛盾")
+        print("  ⚠ downgrade gate = 3 -- in the forced-Gen1 state, yet the link is still Gen2; contradiction")
 
     print()
-    print("  说明：本脚本**不做任何写入**。")
-    print("  验证 0x2241C bit7 的「写 1 立刻回 Gen2」需要写操作，")
-    print("  但那会先把链路降到 Gen1（写 0 才测得出切换），风险与收益不匹配 —— 未做。")
+    print("  note: this script **performs no writes**.")
+    print("  Verifying 'write 1 to 0x2241C bit7 returns to Gen2 immediately' requires a write,")
+    print("  but that would first drop the link to Gen1 (writing 0 is the only way to measure the switch);")
+    print("  the risk does not match the payoff -- not done.")
 
     m.close(); os.close(f)
     return 0 if ok else 0

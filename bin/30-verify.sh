@@ -1,48 +1,49 @@
 #!/bin/bash
 # ============================================================
-# 30-verify.sh —— 验证：带宽是否达标 + 补丁是否真的接管
+# 30-verify.sh — verify: whether bandwidth meets the target + whether the patch really took over
 #
-# 三个判据，缺一不可：
-#   A. 带宽      pinned H2D ≥ 1.4 GB/s（Gen2 x4 应 ~1.55）
-#                ★ 必须 512MB×15；128MB×3 会落在恢复窗口里只测到 0.78
-#   B. 稳定      N 轮 CUDA 上下文后链路仍是 2
-#   C. 补丁生效  摘掉守卫后链路仍保持（守卫零动作）
+# Three criteria, all of them required:
+#   A. Bandwidth    pinned H2D >= 1.4 GB/s (Gen2 x4 should be ~1.55)
+#                   ★ must be 512MB x 15; 128MB x 3 lands inside the recovery
+#                     window and only measures 0.78
+#   B. Stability    after N rounds of CUDA contexts the link is still 2
+#   C. Patch works  with the guard removed the link still holds (guard does zero work)
 #
-# 用法：
-#   sudo bash bin/30-verify.sh            # A + B（默认 5 轮）
-#   sudo bash bin/30-verify.sh 20         # A + B（20 轮）
-#   sudo bash bin/30-verify.sh --full     # 加做 C（会临时卸掉守卫）
+# Usage:
+#   sudo bash bin/30-verify.sh            # A + B (default 5 rounds)
+#   sudo bash bin/30-verify.sh 20         # A + B (20 rounds)
+#   sudo bash bin/30-verify.sh --full     # also do C (temporarily unloads the guard)
 # ============================================================
 set -u
 
 # ============================================================
-# 1. 变量
+# 1. Variables
 # ============================================================
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-ROUNDS=5                # B 阶段的轮数
-FULL=0                  # 1 = 加做 C 阶段（摘守卫）
-BW_SIZE_MB=512          # 带宽测试：单次大小
-BW_ITERS=15             # 带宽测试：次数（★ 不能用小值，见文件头）
-BW_THRESHOLD=1.4        # A 阶段的门槛（GB/s）
+ROUNDS=5                # number of rounds for stage B
+FULL=0                  # 1 = also do stage C (drop the guard)
+BW_SIZE_MB=512          # bandwidth test: per-run size
+BW_ITERS=15             # bandwidth test: iterations (★ small values are not allowed; see header)
+BW_THRESHOLD=1.4        # threshold for stage A (GB/s)
 
-# 各阶段结果
+# Per-stage results
 A_OK=0
 B_BAD=0
 C_OK=1
-BW_H2D=""               # 实测 pinned H2D（GB/s）
-BW_D2H=""               # 实测 pinned D2H（GB/s）
+BW_H2D=""               # measured pinned H2D (GB/s)
+BW_D2H=""               # measured pinned D2H (GB/s)
 
 # ============================================================
-# 2. 函数
+# 2. Functions
 # ============================================================
 
-# 把 1/0 转成带颜色的文字
+# Convert 1/0 into colored text
 status_text() {
     if [ "$1" = "1" ]; then echo "$2"; else echo "$3"; fi
 }
 
-# 解析参数：--full 或纯数字轮数
+# Parse args: --full or a plain number of rounds
 parse_args() {
     local a
     for a in "$@"; do
@@ -50,8 +51,8 @@ parse_args() {
             --full)
                 FULL=1 ;;
             *[!0-9]*)
-                err "未知参数 ${a}"
-                echo "   用法: sudo bash bin/30-verify.sh [轮数] [--full]"
+                err "unknown option ${a}"
+                echo "   usage: sudo bash bin/30-verify.sh [rounds] [--full]"
                 exit 2 ;;
             *)
                 ROUNDS="${a}" ;;
@@ -59,14 +60,14 @@ parse_args() {
     done
 }
 
-# A. 带宽测试
+# A. Bandwidth test
 check_bandwidth() {
     local out h2d
 
-    hdr "A. 带宽（${BW_SIZE_MB}MB × ${BW_ITERS}）"
+    hdr "A. Bandwidth (${BW_SIZE_MB}MB x ${BW_ITERS})"
 
     if ! is_gen2; then
-        warn "当前不是 Gen2，带宽必然是 Gen1 水平（0.78）"
+        warn "currently not Gen2; bandwidth will necessarily be Gen1 level (0.78)"
     fi
 
     out="$("${BUILD_DIR}/bwtest2" "${BW_SIZE_MB}" "${BW_ITERS}" 2>&1)"
@@ -77,100 +78,100 @@ check_bandwidth() {
     BW_D2H="$(echo "${out}" | grep pinned | grep -o 'D2H med [0-9.]*' | awk '{print $3}')"
 
     echo
-    echo " 测后链路：$(read_regs)"
+    echo " link after the test: $(read_regs)"
 
     if [ -n "${h2d}" ] && python3 -c "import sys; sys.exit(0 if ${h2d} >= ${BW_THRESHOLD} else 1)"; then
-        ok "pinned H2D = ${h2d} GB/s（Gen2 达标）"
+        ok "pinned H2D = ${h2d} GB/s (meets the Gen2 target)"
         A_OK=1
     else
-        err "pinned H2D = ${h2d:-?} GB/s（< ${BW_THRESHOLD}，仍是 Gen1 水平）"
+        err "pinned H2D = ${h2d:-?} GB/s (< ${BW_THRESHOLD}; still Gen1 level)"
         A_OK=0
     fi
 }
 
-# B. 稳定性：连续建 CUDA 上下文，看链路掉不掉
+# B. Stability: create CUDA contexts in a row and see whether the link drops
 check_stability() {
     local i speed
 
-    hdr "B. 稳定性（${ROUNDS} 轮 CUDA 上下文）"
+    hdr "B. Stability (${ROUNDS} rounds of CUDA contexts)"
 
     B_BAD=0
     for i in $(seq 1 "${ROUNDS}"); do
         "${BUILD_DIR}/minictx" 1 >/dev/null 2>&1
         sleep 0.8
         speed="$(cur_speed)"
-        printf '   第 %2d 轮: LNKSTA=%s  %s\n' "${i}" "${speed}" \
-            "$([ "${speed}" = "2" ] && echo ok || echo '★掉级')"
+        printf '   round %2d: LNKSTA=%s  %s\n' "${i}" "${speed}" \
+            "$([ "${speed}" = "2" ] && echo ok || echo '★dropped')"
         [ "${speed}" = "2" ] || B_BAD=$((B_BAD + 1))
     done
 
     sleep 3
-    echo "   3s 后：$(read_regs)"
+    echo "   after 3s: $(read_regs)"
     if [ "${B_BAD}" = "0" ]; then
-        ok "全程保持 Gen2"
+        ok "stayed Gen2 throughout"
     else
-        err "${B_BAD} 轮掉级"
+        err "${B_BAD} rounds dropped"
     fi
 }
 
-# C. 补丁独立性：摘掉守卫再测，看链路是否仍保持
+# C. Patch independence: drop the guard and re-test to see whether the link still holds
 check_patch_independence() {
     local i speed cbad
 
-    hdr "C. 补丁独立性（临时摘掉守卫）"
-    echo "   理由：带着守卫测，测不出补丁的作用 —— 守卫会把链路拉回来。"
+    hdr "C. Patch independence (temporarily dropping the guard)"
+    echo "   rationale: testing with the guard attached cannot measure the patch's effect -- the guard pulls the link back."
 
     if lsmod | grep -q '^gen2kr'; then
-        rmmod gen2kr && echo "   gen2kr 已卸载"
+        rmmod gen2kr && echo "   gen2kr unloaded"
     fi
     sleep 1
-    echo "   摘守卫前：$(read_regs)"
+    echo "   before dropping the guard: $(read_regs)"
 
     cbad=0
     for i in $(seq 1 3); do
         "${BUILD_DIR}/minictx" 1 >/dev/null 2>&1
         sleep 0.8
         speed="$(cur_speed)"
-        printf '     第 %d 轮: LNKSTA=%s\n' "${i}" "${speed}"
+        printf '     round %d: LNKSTA=%s\n' "${i}" "${speed}"
         [ "${speed}" = "2" ] || cbad=$((cbad + 1))
     done
 
     sleep 8
-    echo "   再等 8s：$(read_regs)"
+    echo "   after another 8s: $(read_regs)"
     is_gen2 || cbad=$((cbad + 1))
 
     if [ "${cbad}" = "0" ]; then
-        ok "补丁独立有效：无守卫时链路仍保持 Gen2"
+        ok "patch works independently: without the guard the link still holds Gen2"
         C_OK=1
     else
-        err "补丁不足：无守卫时有 ${cbad} 次掉级"
+        err "patch insufficient: ${cbad} drops without the guard"
         C_OK=0
     fi
 
-    echo "   重新装载守卫（安全网）："
+    echo "   re-loading the guard (safety net):"
     if insmod "${BUILD_DIR}/gen2kr.ko" 2>/dev/null; then
-        echo "     gen2kr 已恢复"
+        echo "     gen2kr restored"
     else
-        warn "gen2kr 恢复失败"
+        warn "failed to restore gen2kr"
     fi
 }
 
-# 汇总
+# Summary
 show_summary() {
     echo
     echo "======================================================"
-    echo " 结论"
+    echo " Conclusion"
     echo "======================================================"
-    echo "   A 带宽      : $(status_text "${A_OK}" "${C_G}通过${C_0}" "${C_R}未达标${C_0}")  pinned H2D=${BW_H2D:-?} D2H=${BW_D2H:-?}"
-    echo "   B 稳定性    : $(status_text "$([ "${B_BAD}" = "0" ] && echo 1 || echo 0)" "${C_G}通过${C_0}" "${C_R}${B_BAD} 轮掉级${C_0}")"
+    echo "   A bandwidth         : $(status_text "${A_OK}" "${C_G}pass${C_0}" "${C_R}below target${C_0}")  pinned H2D=${BW_H2D:-?} D2H=${BW_D2H:-?}"
+    echo "   B stability         : $(status_text "$([ "${B_BAD}" = "0" ] && echo 1 || echo 0)" "${C_G}pass${C_0}" "${C_R}${B_BAD} rounds dropped${C_0}")"
     if [ "${FULL}" = "1" ]; then
-        echo "   C 补丁独立性: $(status_text "${C_OK}" "${C_G}通过${C_0}" "${C_R}未通过${C_0}")"
+        echo "   C patch independence: $(status_text "${C_OK}" "${C_G}pass${C_0}" "${C_R}fail${C_0}")"
     fi
-    echo "   链路        : $(read_regs)"
+    echo "   link                : $(read_regs)"
     echo
-    echo "   Xid 检查："
-    dmesg | grep -i 'Xid' | tail -3 | sed 's/^/     /' || echo "     无"
-    echo "     （注意 r8169 网卡也会报 XID，与 GPU 无关）"
+    echo "   Xid check:"
+    dmesg | grep -i 'Xid' | tail -3 | sed 's/^/     /' || echo "     none"
+    echo "     (note: the r8169 NIC also reports XID; unrelated to the GPU)"
     echo "======================================================"
 }
 
@@ -184,9 +185,9 @@ main() {
     ensure_build auto || exit 1
 
     echo "======================================================"
-    echo " 验证（${ROUNDS} 轮）"
+    echo " Verify (${ROUNDS} rounds)"
     echo "======================================================"
-    echo " 起点：$(read_regs)"
+    echo " starting point: $(read_regs)"
 
     check_bandwidth
     check_stability

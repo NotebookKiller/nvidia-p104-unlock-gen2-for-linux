@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
-"""unlock-decl.py —— 只做「解锁声明 + 触发训练」，验证补丁后链路能否自愈
+"""unlock-decl.py — does only "unlock the declaration + trigger training", to
+verify the link can self-heal after the patch
 
-## 为什么需要它（reports/195）
+## Why this is needed (reports/195)
 
-`_nv017281rm` 每次 cuCtxCreate 都会把 `0x8C040.SPEED` 写成"当前链路速率"：
-  · 补丁前：sp==1 → 写 SPEED=2 (0x80000) → 2.5GT/s → **锁死 Gen1**
-  · 补丁后：sp==1 → 写 SPEED=1 (0x40000) → **请求 5.0GT/s**
+`_nv017281rm` writes `0x8C040.SPEED` as "the current link speed" on every
+cuCtxCreate:
+  · before the patch: sp==1 -> writes SPEED=2 (0x80000) -> 2.5GT/s -> **pinned at Gen1**
+  · after the patch:  sp==1 -> writes SPEED=1 (0x40000) -> **requests 5.0GT/s**
 
-补丁已实测生效（R8 从 0x20085800 → 0x20045800）。
-但链路仍是 Gen1，因为**声明 `LINK_CAP2` 还是 0x0002（只支持 Gen1）**，硬件拒绝协商 5GT/s。
+The patch is confirmed to work in practice (R8 went 0x20085800 -> 0x20045800).
+But the link is still Gen1, because **the declaration `LINK_CAP2` is still
+0x0002 (Gen1 only)**, so the hardware refuses to negotiate 5GT/s.
 
-所以只要把声明解锁，再触发一次 LTSSM 训练，链路**应该自己升到 5GT/s** ——
-因为目标速率 SPEED=1 已经由驱动（补丁后）写好了。
+So: unlock the declaration, then trigger one LTSSM training, and the link
+**should climb to 5GT/s by itself** — because the target speed SPEED=1 was
+already written by the (patched) driver.
 
-这比 safe-gen2.py 少做两件事，也因此更安全：
-  · **不写 0x8C040.SPEED**（已经是 1，不需要我们写；避开了"训练未完成时写 SPEED"这条必死路径）
-  · **不做 ⑤→⑥ 的强制重训**（除非必要，且只从根端口发）
+This does two fewer things than safe-gen2.py, and is therefore safer:
+  · **does not write 0x8C040.SPEED** (it is already 1; no need for us to write
+    it; avoids the "write SPEED while training is incomplete" path that killed
+    devices every time)
+  · **skips the forced ⑤->⑥ retrain** (unless necessary, and only from the
+    root port)
 
-## 安全约束（沿用 reports/186 的定案）
-  ① 解锁声明：写 XP3G 四寄存器 + `0x8841C` **读值再 OR**（绝不写绝对值）+ `0x88610`
-  ② `0x8872C = 6` 触发训练，然后**至少等 5s / 轮询 LCAP2 变 0x06**
-  ③ 只从**根端口** Retrain，**绝不碰端点**
-  ④ 每次高危写后回读；连续 20 次 0xffffffff 才判死
+## Safety constraints (carried over from reports/186's settled rules)
+  ① Unlock the declaration: write the four XP3G registers + `0x8841C`
+     **read-then-OR** (never write an absolute value) + `0x88610`
+  ② `0x8872C = 6` triggers training, then **wait at least 5s / poll until
+     LCAP2 becomes 0x06**
+  ③ Retrain only from the **root port**; **never touch the endpoint**
+  ④ Read back after every high-risk write; only 20 consecutive 0xffffffff
+     readings count as dead
 
-用法：
+Usage:
   sudo python3 unlock-decl.py --dry-run
   sudo python3 unlock-decl.py
-  sudo python3 unlock-decl.py --retrain      # 若训练后仍未升，补一次根端口 Retrain
+  sudo python3 unlock-decl.py --retrain      # if it still has not risen after training, one more root-port retrain
 """
 import mmap
 import os
@@ -77,7 +87,8 @@ def pci(sel, reg):
 
 class Bar:
     def __init__(self, phys):
-        # ★ 必须 O_RDWR：O_RDONLY 打开后再请求 PROT_WRITE 会 PermissionError
+        # ★ O_RDWR is mandatory: opening O_RDONLY and then requesting
+        # PROT_WRITE raises PermissionError
         self.fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
         self.pg = 0
         self.m = mmap.mmap(self.fd, 0x1000000, mmap.MAP_SHARED,
@@ -90,7 +101,8 @@ class Bar:
         struct.pack_into("<I", self.m, o - self.pg, v & 0xFFFFFFFF)
 
     def alive(self):
-        """★ 连续 20 次 0xffffffff 才判死（单次是重训瞬态）"""
+        """★ only 20 consecutive 0xffffffff readings count as dead (a single
+        one is a retrain transient)"""
         bad = 0
         for _ in range(GRACE):
             if self.rd(R_LNKCAP2) == 0xFFFFFFFF:
@@ -111,8 +123,8 @@ def show(tag, bar):
     sp = bar.rd(R_SPEED)
     ls = bar.rd(R_LNKSTA)
     print(f"[{tag}]")
-    print(f"  LCAP2(声明) = {bar.rd(R_LNKCAP2):#06x}"
-          f"   {'✓ 已解锁' if bar.rd(R_LNKCAP2) == 0x06 else '（未解锁，含 Gen1 only）'}")
+    print(f"  LCAP2 (declaration) = {bar.rd(R_LNKCAP2):#06x}"
+          f"   {'✓ unlocked' if bar.rd(R_LNKCAP2) == 0x06 else '(not unlocked; Gen1 only among them)'}")
     print(f"  0x8C040    = {sp:#010x}   SPEED={(sp >> 18) & 3}"
           f"  (1=5GT/s  2=2.5GT/s)")
     print(f"  0x88088    = {ls:#010x}   LNKSTA[3:0]={(ls >> 16) & 0xF}"
@@ -121,25 +133,25 @@ def show(tag, bar):
 
 def main():
     if os.geteuid() != 0:
-        print("需要 root"); return 1
+        print("root required"); return 1
     dry = "--dry-run" in sys.argv
     do_retrain = "--retrain" in sys.argv
 
     phys = bar0_addr()
     if not phys:
-        print("取不到 BAR0"); return 1
-    print(f"BAR0 = {phys:#x}   模式={'dry-run' if dry else '执行'}\n")
+        print("cannot get BAR0"); return 1
+    print(f"BAR0 = {phys:#x}   mode={'dry-run' if dry else 'live'}\n")
 
     bar = Bar(phys)
     if not bar.alive():
-        print("MMIO 不应答 —— 先跑 pci-state.sh"); bar.close(); return 1
+        print("MMIO not responding — run pci-state.sh first"); bar.close(); return 1
 
-    show("⓪ 起点", bar)
+    show("⓪ starting point", bar)
     if dry:
-        print("\n--dry-run：只看不改。"); bar.close(); return 0
+        print("\n--dry-run: observe only, no changes."); bar.close(); return 0
 
-    # ---- ① 解锁声明 ----
-    print("\n=== ① 解锁声明（从不掉卡）===")
+    # ---- ① unlock the declaration ----
+    print("\n=== ① unlock the declaration (never kills the card) ===")
     for off, val, nm in XP3G:
         bar.wr(off, val)
         print(f"  {nm:10s}= {val:#010x}  {'✓' if bar.rd(off) == val else '✗'}")
@@ -147,79 +159,79 @@ def main():
     c = bar.rd(R_CONFIG)
     newc = (c | (1 << 11) | (1 << 13) | (1 << 15)) & ~((1 << 12) | (1 << 14))
     bar.wr(R_CONFIG, newc)
-    print(f"  0x8841C    {c:#010x} → {bar.rd(R_CONFIG):#010x}  (读值再OR, 置15/13/11 清12/14)")
+    print(f"  0x8841C    {c:#010x} -> {bar.rd(R_CONFIG):#010x}  (read-then-OR, set 15/13/11 clear 12/14)")
 
     g = bar.rd(R_VSEC)
     bar.wr(R_VSEC, (g & ~(1 << 12)) | 1)
-    print(f"  0x88610    {g:#010x} → {bar.rd(R_VSEC):#010x}")
+    print(f"  0x88610    {g:#010x} -> {bar.rd(R_VSEC):#010x}")
 
     v = bar.rd(R_VSECDEV)
     bar.wr(R_VSECDEV, v | 1)
-    print(f"  0x8860C    {v:#010x} → {bar.rd(R_VSECDEV):#010x}")
+    print(f"  0x8860C    {v:#010x} -> {bar.rd(R_VSECDEV):#010x}")
 
     cya = bar.rd(R_CYA)
     if (cya >> 2) & 1:
-        bar.wr(R_CYA, cya & ~(1 << 2)); print(f"  0x8C2C0    DIS_G2 已清")
+        bar.wr(R_CYA, cya & ~(1 << 2)); print(f"  0x8C2C0    DIS_G2 cleared")
     else:
-        print(f"  0x8C2C0    = {cya:#010x}  DIS_G2 本就 0")
+        print(f"  0x8C2C0    = {cya:#010x}  DIS_G2 was already 0")
 
     if not bar.alive():
-        print("!! ① 之后 MMIO 无应答，立即停止"); bar.close(); return 2
+        print("!! MMIO stopped responding after ①; stopping immediately"); bar.close(); return 2
 
-    # ---- ② 触发训练 ----
-    print("\n=== ② 写 0x8872C = 6（触发动 LTSSM 训练；写本身安全）===")
+    # ---- ② trigger training ----
+    print("\n=== ② write 0x8872C = 6 (fires the LTSSM training; the write itself is safe) ===")
     bar.wr(R_LTSSM, 6)
     print(f"  0x8872C    = {bar.rd(R_LTSSM):#x}")
 
-    # ---- ③ 等训练完成 ----
-    print("\n=== ③ 等声明锁存（LCAP2 → 0x06），至少 5s ===")
+    # ---- ③ wait for training to finish ----
+    print("\n=== ③ wait for the declaration to latch (LCAP2 -> 0x06), at least 5s ===")
     t0 = time.time()
     latched = False
     while time.time() - t0 < 25:
         if not bar.alive():
-            print("!! ③ 期间 MMIO 无应答"); bar.close(); return 2
+            print("!! MMIO stopped responding during ③"); bar.close(); return 2
         v2 = bar.rd(R_LNKCAP2)
         if v2 == 0x06:
             latched = True
-            print(f"  {time.time()-t0:.1f}s 后 LCAP2 = 0x06  ✓ 锁存")
+            print(f"  LCAP2 = 0x06 after {time.time()-t0:.1f}s  ✓ latched")
             break
         time.sleep(0.5)
     if not latched:
-        print(f"  ✗ 25s 内未锁存，LCAP2 = {bar.rd(R_LNKCAP2):#06x}")
+        print(f"  ✗ did not latch within 25s; LCAP2 = {bar.rd(R_LNKCAP2):#06x}")
 
-    show("③ 训练后", bar)
+    show("③ after training", bar)
 
-    # ---- ④ 看 SPEED 是否已由驱动设好 ----
-    print("\n=== ④ 检查 0x8C040.SPEED（补丁后应由驱动写成 1）===")
+    # ---- ④ check whether SPEED was already set by the driver ----
+    print("\n=== ④ check 0x8C040.SPEED (after the patch the driver should have written 1) ===")
     sp = bar.rd(R_SPEED)
     speed = (sp >> 18) & 3
     if speed == 1:
-        print(f"  SPEED = 1 (5.0GT/s)  ✓ 补丁已生效，目标速率正确")
+        print(f"  SPEED = 1 (5.0GT/s)  ✓ patch is in effect; target speed correct")
     else:
-        print(f"  SPEED = {speed}  ⚠ 不是 1 —— 补丁可能未生效，或驱动尚未写过")
+        print(f"  SPEED = {speed}  ⚠ not 1 —— the patch may not be in effect, or the driver has not written it yet")
 
-    # ---- ⑤ 可选：根端口 Retrain ----
+    # ---- ⑤ optional: root-port retrain ----
     if do_retrain:
-        print("\n=== ⑤ 从【根端口】Retrain（绝不碰端点），最多 6 轮 ===")
+        print("\n=== ⑤ retrain from the [root port] (never touch the endpoint), up to 6 rounds ===")
         for i in range(1, 7):
             if not bar.alive():
-                print(f"!! 第 {i} 轮前 MMIO 无应答"); bar.close(); return 2
+                print(f"!! MMIO stopped responding before round {i}"); bar.close(); return 2
             cur = pci(ROOT, "CAP_EXP+0x10.w")
             if cur is None:
-                print("  根端口读不到 LNKCTL"); break
+                print("  cannot read the root port's LNKCTL"); break
             sh(f"setpci -s {ROOT} CAP_EXP+0x10.w={((cur | (1 << 5)) & 0xFFFF):04x}")
             time.sleep(1.5)
             ls = bar.rd(R_LNKSTA)
             sp2 = (ls >> 16) & 0xF
-            print(f"  第 {i} 轮后 LNKSTA[3:0] = {sp2}  {'★Gen2' if sp2 == 2 else ''}")
+            print(f"  after round {i} LNKSTA[3:0] = {sp2}  {'★Gen2' if sp2 == 2 else ''}")
             if sp2 == 2:
                 break
 
-    show("最终", bar)
+    show("final", bar)
 
-    print("\n=== 物理链路（lspci 官方判据）===")
+    print("\n=== physical link (lspci's official verdict) ===")
     r = sh(f"lspci -vv -s {DEV} 2>/dev/null | grep -o 'LnkSta:.*' | head -1")
-    print("  " + (r.stdout.strip() or "(读不到)"))
+    print("  " + (r.stdout.strip() or "(unreadable)"))
 
     bar.close()
     return 0

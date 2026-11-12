@@ -1,37 +1,40 @@
 #!/bin/bash
 # ============================================================
-# utils/bdf.sh —— 目标 GPU 的 PCIe BDF 自动发现（**单一来源**）
+# utils/bdf.sh -- Automatic discovery of the target GPU's PCIe BDF (**single source of truth**)
 #
-# 被 drivers/<版本>/utils/_lib.sh 和 bin/_common.sh source。
+# Sourced by drivers/<version>/utils/_lib.sh and bin/_common.sh.
 #
-# 为什么必须自动发现：
-#   硬编码 01:00.0 时，多卡机上会**对着错卡读写**。同机还有一张已满速 Gen3 的
-#   P100 时，脚本会读出 CAP2=0x0006 / TLS=2 / LNKSTA 恒 1041 —— 看起来像"锁死"，
-#   实际是设备选错了；而 10-check 的设备检查用的是另一个来源，就会出现
-#   "第 2 节说 P104 在总线、第 3 节却显示 P100 的 cfg"这种自相矛盾。
+# Why automatic discovery is mandatory:
+#   With a hardcoded 01:00.0, a multi-GPU machine would **read and write the wrong card**.
+#   If the same machine also has a P100 already at full-speed Gen3, the script would read
+#   CAP2=0x0006 / TLS=2 / LNKSTA stuck at 1041 -- which looks like a "hard lock",
+#   but is actually the wrong device; and since 10-check's device check uses a different
+#   source, you get self-contradictory output like "section 2 says P104 is on the bus
+#   while section 3 shows P100's cfg".
 #
-# 环境变量：
-#   TARGET_IDS   目标 device id，空格分隔（默认 "1b87" = P104-100）
-#                同 family 受限矿卡：1b07 P102-100 / 1b87 P104-100 /
+# Environment variables:
+#   TARGET_IDS   Target device ids, space-separated (default "1b87" = P104-100)
+#                Restricted mining cards in the same family: 1b07 P102-100 / 1b87 P104-100 /
 #                1bc7 P104-101 / 1c07 P106-100 / 1c09 P106-090
-#   TARGET_BDF   显式指定 BDF，跳过自动发现（多卡同型时必须用）
+#   TARGET_BDF   Explicitly specify the BDF, skipping auto-discovery (mandatory when
+#                several identical cards are present)
 #
-# 导出：DEV_BDF（0000:01:00.0） DEV_SHORT（01:00.0） ROOT_BDF（上游根端口）
+# Exports: DEV_BDF (0000:01:00.0)  DEV_SHORT (01:00.0)  ROOT_BDF (upstream root port)
 #
-# 用法：
-#   source utils/bdf.sh              # 通常由 _lib.sh 代劳
-#   bash utils/bdf.sh                # 单独跑：只打印发现的 BDF
+# Usage:
+#   source utils/bdf.sh              # normally done for you by _lib.sh
+#   bash utils/bdf.sh                # run standalone: only prints the discovered BDF
 # ============================================================
 
 if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
-    # 被 source：重复 source 直接返回
+    # Sourced: a repeated source returns directly
     [ -n "${_BDF_SH_LOADED:-}" ] && return 0
     _BDF_SH_LOADED=1
 fi
 
 _bdf_err() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
 
-# 扫 /sys/bus/pci/devices，按 vendor:device 找目标卡
+# Scan /sys/bus/pci/devices, matching target cards by vendor:device
 _bdf_scan() {
     local d vid did out=""
     for d in /sys/bus/pci/devices/*; do
@@ -50,8 +53,8 @@ TARGET_IDS="${TARGET_IDS:-1b87}"
 
 if [ -n "${TARGET_BDF:-}" ]; then
     if [ ! -d "/sys/bus/pci/devices/${TARGET_BDF}" ]; then
-        _bdf_err "TARGET_BDF=${TARGET_BDF} 不存在"
-        echo "    列出所有 NVIDIA 设备：lspci -Dn | grep 10de" >&2
+        _bdf_err "TARGET_BDF=${TARGET_BDF} does not exist"
+        echo "    List all NVIDIA devices: lspci -Dn | grep 10de" >&2
         exit 3
     fi
     DEV_BDF="${TARGET_BDF}"
@@ -64,14 +67,14 @@ else
     fi
 
     if [ "${_bdf_n}" -eq 0 ]; then
-        _bdf_err "找不到目标设备（10de:${TARGET_IDS// /,}）"
-        echo "    本机所有 NVIDIA 设备：" >&2
+        _bdf_err "No target device found (10de:${TARGET_IDS// /,})"
+        echo "    All NVIDIA devices on this machine:" >&2
         lspci -Dn 2>/dev/null | grep -i ' 10de:' | sed 's/^/      /' >&2
-        echo "    若 device id 不同，用：TARGET_IDS=\"1b87 1c07\" sudo -E bash \$0" >&2
+        echo "    If the device id differs, use: TARGET_IDS=\"1b87 1c07\" sudo -E bash \$0" >&2
         exit 3
     elif [ "${_bdf_n}" -gt 1 ]; then
-        _bdf_err "找到 ${_bdf_n} 张目标设备，无法自动选择：${_bdf_cands}"
-        echo "    必须显式指定，否则可能操作错卡（会破坏另一张卡的链路）：" >&2
+        _bdf_err "Found ${_bdf_n} matching devices; cannot auto-select: ${_bdf_cands}"
+        echo "    You must specify one explicitly, otherwise the wrong card may be modified (breaking another card's link):" >&2
         echo "        TARGET_BDF=0000:02:00.0 sudo -E bash \$0" >&2
         exit 3
     fi
@@ -79,12 +82,12 @@ else
 fi
 
 DEV_SHORT="${DEV_BDF#0000:}"
-# 上游根端口：用 readlink 解析出父设备，不再假设 00:01.0
+# Upstream root port: resolve the parent device with readlink instead of assuming 00:01.0
 ROOT_BDF="$(basename "$(dirname "$(readlink -f "/sys/bus/pci/devices/${DEV_BDF}")")")"
 
 export DEV_BDF DEV_SHORT ROOT_BDF TARGET_IDS
 
-# 直接执行时打印结果
+# When executed directly, print the result
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     echo "DEV_BDF   = ${DEV_BDF}"
     echo "DEV_SHORT = ${DEV_SHORT}"

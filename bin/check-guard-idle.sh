@@ -1,16 +1,19 @@
 #!/bin/bash
-# check-guard-idle.sh —— 补丁 + 守卫共存时，守卫是否完全不动
+# check-guard-idle.sh — when the patch and the guard coexist, does the guard stay completely idle?
 #
-# ## 为什么查这个
-#   补丁让驱动不再降 Gen1（reports/199）。那守卫（gen2kr 的 guard_fn）
-#   在链路一直 Gen2 的情况下应该**一次都不动作**。
-#   若仍看到 "[guard] ..." 日志，说明还有别的降级路径，补丁没完全接管。
+# ## Why check this
+#   The patch stops the driver from downgrading to Gen1 (reports/199). So the
+#   guard (gen2kr's guard_fn) should **never act** while the link stays Gen2.
+#   If "[guard] ..." logs still appear, some other downgrade path remains and
+#   the patch has not fully taken over.
 #
-# ## 判据
-#   · dmesg 中 "gen2kr.*guard" 条数 == 0  ⇒ 补丁完全接管，守卫纯安全网
-#   · > 0                                  ⇒ 链路掉过，需查原因
+# ## Criteria
+#   · count of "gen2kr.*guard" lines in dmesg == 0  => the patch fully took
+#     over; the guard is a pure safety net
+#   · > 0                                            => the link dropped at
+#     some point; investigate
 #
-# 用法：bash check-guard-idle.sh [轮数]
+# Usage: bash check-guard-idle.sh [rounds]
 set -u
 D="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 N="${1:-4}"
@@ -27,42 +30,42 @@ try:
     print(f"CAP2={a:#06x} LNKSTA={(l>>16)&0xF}")
     m.close(); os.close(f)
 except Exception:
-    print("读不到")
+    print("unreadable")
 PY
 }
 
 dmesg -C >/dev/null 2>&1
 if ! lsmod | grep -q '^gen2kr'; then
-  cd "$D/kmod" && insmod gen2kr.ko && echo "  已加载 gen2kr（作为安全网）"
+  cd "$D/kmod" && insmod gen2kr.ko && echo "  loaded gen2kr (as a safety net)"
 else
-  echo "  gen2kr 已在"
+  echo "  gen2kr already in"
 fi
 sleep 2
 
-echo "  起点: $(st)"
+echo "  starting point: $(st)"
 echo
-echo "  跑 $N 轮 CUDA 上下文（每轮 1 次 cuInit）："
+echo "  running $N rounds of CUDA contexts (one cuInit per round):"
 for i in $(seq 1 "$N"); do
   "$D/build/minictx" 1 >/dev/null 2>&1
   sleep 1
-  echo "    第 $i 轮后: $(st)"
+  echo "    after round $i: $(st)"
 done
 
 echo
-echo "  再等 8s 确认不是延迟降级..."
+echo "  waiting another 8s to rule out a delayed downgrade..."
 sleep 8
-echo "    8s 后: $(st)"
+echo "    after 8s: $(st)"
 
 echo
 G=$(dmesg | grep -c 'gen2kr.*guard' || true)
-echo "======== guard 日志条数: $G ========"
+echo "======== guard log line count: $G ========"
 if [ "$G" = "0" ]; then
-  echo "  ★ 守卫零动作 ⇒ 补丁完全接管，守卫只是安全网"
+  echo "  ★ the guard did nothing => the patch fully took over; the guard is just a safety net"
 else
-  echo "  ⚠ 守卫动作过 $G 次，说明链路掉过。最近几条："
+  echo "  ⚠ the guard acted $G times, which means the link dropped. Recent lines:"
   dmesg | grep 'gen2kr.*guard' | tail -6
 fi
 
 echo
-echo "======== gen2kr 全部日志 ========"
-dmesg | grep gen2kr | tail -10 || echo "  （无）"
+echo "======== all gen2kr logs ========"
+dmesg | grep gen2kr | tail -10 || echo "  (none)"

@@ -1,130 +1,150 @@
-# 按驱动版本组织的补丁
+# Patches organized by driver version
 
-> ⚠ 补丁跟驱动版本强绑定。换版本需按下面的方法自行重新定位。
+> ⚠ Patches are strongly bound to the driver version. Switching versions
+> requires re-locating everything yourself, following the method below.
 
-每个子目录对应**一个 NVIDIA 驱动版本**，里面是那个版本上验证过的全部补丁。
-思路参考 [vGPU-Unlock-patcher](https://github.com/VGPU-Community-Drivers/vGPU-Unlock-patcher)
-的 `patches/blob-<version>.diff` 约定：**偏移和字节都跟版本绑定，不能跨版本套用**。
+Each subdirectory corresponds to **one NVIDIA driver version** and contains all
+the patches verified on that version. The layout follows the
+[vGPU-Unlock-patcher](https://github.com/VGPU-Community-Drivers/vGPU-Unlock-patcher)
+convention of `patches/blob-<version>.diff`: **offsets and bytes are bound to
+the version and cannot be reused across versions**.
 
-## 为什么按版本分目录
+## Why directories are per version
 
-补丁改的是**闭源二进制的具体字节**。换一个驱动版本：
+Patches modify **specific bytes of closed-source binaries**. When the driver
+version changes:
 
-- 函数位置会变（`nvidia.ko` 里 `.text` 偏移变）
-- 甚至代码结构会变（`libnvidia-glcore.so` 里判据偏移会变）
-- md5 完全不同
+- function locations move (the `.text` offsets inside `nvidia.ko` change)
+- even code structure can move (the criterion offsets inside
+  `libnvidia-glcore.so` change)
+- the md5 is completely different
 
-所以每个版本都要**重新定位、重新验证**，不能复用别的版本的数字。
-把「版本 → 偏移 → 验证数据」固定在一个目录里，是唯一不会搞混的做法。
+So every version must be **re-located and re-verified**; numbers from another
+version cannot be reused. Pinning "version -> offsets -> verification data"
+inside one directory is the only way that avoids mix-ups.
 
-## 目录约定
+## Directory conventions
 
 ```
-drivers/<驱动版本>/
-├── README.md      这个版本的简介：有哪些补丁、偏移表、验证数据、风险
-├── offsets.sh     机器可读的偏移（可被 source，也可直接看）
-├── 00-whitelist.sh   前置（可选）：解除受限 SKU
-├── 01-gen2-patch.sh  必做：改 nvidia.ko（不再降级）
-├── 02-gen2-push.sh   必做：加载模块 + 推送链路
-├── _lib.sh           公共 bash 函数
-├── _patch.py         通用二进制补丁器（JSON 规格驱动）
+drivers/<driver-version>/
+├── README.md      overview of this version: patches, offset tables, verification data, risks
+├── offsets.sh     machine-readable offsets (can be sourced, or just read)
+├── 00-whitelist.sh   pre-step (optional): lift the restricted SKU
+├── 01-gen2-patch.sh  required: patch nvidia.ko (no more downgrades)
+├── 02-gen2-push.sh   required: load the module + push the link
+├── _lib.sh           shared bash helpers
+├── _patch.py         generic binary patcher (driven by a JSON spec)
 └── kernel/
-    └── <内核版本>/    ← ★ 内核模块按【内核版本】再分一层
-        ├── README.md      这套内核上的模块说明
-        ├── gen2kr.c       kretprobe + 推送 + 守卫
+    └── <kernel-version>/    ← ★ kernel modules get one more layer, by [kernel version]
+        ├── README.md      description of the module on this kernel
+        ├── gen2kr.c       kretprobe + push + guard
         ├── Makefile
         └── gen2kr.service
 ```
 
-### 为什么内核模块要按内核版本分目录
+### Why kernel modules are nested by kernel version
 
-补丁偏移跟**驱动版本**绑定；内核模块的编译产物跟**内核版本**绑定。两者是不同的东西：
+Patch offsets are bound to the **driver version**; the kernel module build
+artifact is bound to the **kernel version**. They are two different things:
 
-| | 绑定什么 | 为什么 |
+| | bound to | why |
 |---|---|---|
-| `offsets.sh` / `_patch.py` / `0x-*.sh` | 驱动版本 | 改的是驱动二进制的字节偏移 |
-| `kernel/<内核版本>/` | 内核版本 | `.ko` 只能用目标机器的内核头编，换内核就加载不了 |
+| `offsets.sh` / `_patch.py` / `0x-*.sh` | driver version | they modify byte offsets of the driver binary |
+| `kernel/<kernel-version>/` | kernel version | the `.ko` must be compiled against the target machine's kernel headers; a different kernel cannot load it |
 
-所以是两级：`drivers/<驱动>/kernel/<内核>/`。
-换内核版本时**新建同级目录**，不要原地改名 —— 老目录是历史验证记录。
+So there are two levels: `drivers/<driver>/kernel/<kernel>/`.
+When the kernel version changes, **create a new sibling directory** instead of
+renaming in place — the old directory is the historical verification record.
 
-`bin/build.sh` 会自动找匹配当前内核的目录（`_common.sh` 里的 `find_kmod_dir`），
-找不到精确匹配就退回"仓库里只有一套"的那套，并提示版本可能不符。
+`bin/build.sh` automatically looks up the directory matching the current
+kernel (`find_kmod_dir` in `_common.sh`); with no exact match it falls back to
+"the only set in the repo" and warns that the versions may not match.
 
-### 00/01 与 02 的分工
+### Division of labor between 00/01 and 02
 
-| 脚本 | 管什么 | 本质 |
+| script | what it handles | mechanism |
 |---|---|---|
-| `00-whitelist.sh` | 帧率/功耗（可选） | 改字节 |
-| `01-gen2-patch.sh` | 让驱动不再降级 | 改字节 |
-| `02-gen2-push.sh` | 把链路推上去 | 加载内核模块 |
+| `00-whitelist.sh` | frame cap / power cap (optional) | byte patch |
+| `01-gen2-patch.sh` | stop the driver downgrading | byte patch |
+| `02-gen2-push.sh` | push the link up | load the kernel module |
 
-00/01 是**字节级补丁**，独立可用（不需要克隆整个仓库，只要 `_lib.sh` / `_patch.py` / `offsets.sh`）。
-02 负责加载 `kernel/<内核版本>/` 编出来的模块。
+00/01 are **byte-level patches** and work standalone (no need to clone the
+whole repo; only `_lib.sh` / `_patch.py` / `offsets.sh` are needed).
+02 loads the module built from `kernel/<kernel-version>/`.
 
-三个脚本都可以在版本目录里直接跑，不必回仓库根：
+All three scripts run directly inside the version directory; no need to go
+back to the repo root:
 
 ```bash
 cd drivers/580.178.04
 sudo bash 01-gen2-patch.sh apply
-# 重载/重启后
+# after the reload/reboot
 sudo bash 02-gen2-push.sh start
 ```
 
-## 已有版本
+## Versions present
 
-| 版本 | 补丁 | 状态 | 内核 |
+| version | patches | status | kernel |
 |---|---|---|---|
-| [580.178.04](580.178.04/README.md) | Gen2 解锁（2 字节）<br>每批延迟（1 字节）<br>内核白名单（10 字节） | ✅ 全部实测 | 6.12.113 |
+| [580.178.04](580.178.04/README.md) | Gen2 unlock (2 bytes)<br>per-batch delay (1 byte)<br>kernel whitelist (10 bytes) | ✅ all measured live | 6.12.113 |
 
-> 目前只有一个版本。以后加新版本：复制 `580.178.04/` 当模板，
-> **每一处偏移都要重新定位并实测**，不能照抄。
+> Only one version exists so far. To add a new one later: copy `580.178.04/`
+> as the template, then **re-locate and re-measure every single offset**; do
+> not copy the numbers.
 
-## 本目录提供两个补丁
+## This directory provides two patches
 
-本项目聚焦 **PCIe Gen2 解锁**。这里只放与它直接相关的补丁：
+This project focuses on the **PCIe Gen2 unlock**. Only patches directly
+related to it live here:
 
-| 补丁 | 解决 | 症状 | 改哪个文件 | 改动量 |
+| patch | solves | symptom | file modified | change size |
 |---|---|---|---|---|
-| **Gen2** | PCIe 链路速率 | `0.78 GB/s`（Gen1 x4） | `nvidia.ko` | 2 字节 |
-| **whitelist** | 驱动的「受限 SKU」判定 | 帧率卡 ~40fps，功耗上不去 | `nv-kernel.o_binary` | 10 字节 |
+| **Gen2** | PCIe link speed | `0.78 GB/s` (Gen1 x4) | `nvidia.ko` | 2 bytes |
+| **whitelist** | the driver's "restricted SKU" check | framerate stuck ~40fps, power cannot climb | `nv-kernel.o_binary` | 10 bytes |
 
-两者独立，可单独用，也可叠加。
+The two are independent: usable alone, or stacked.
 
-### 关于「每批次延迟」（gr3d delay）—— 仅引用，本项目不实现
+### About "per-batch delay" (gr3d delay) — referenced only; not implemented here
 
-P1XX / CMP 矿卡还有一个**独立的**性能限制：驱动每批次向 pushbuffer 写入
-`method 0x3998 = 0xF0(240)`，240 × 0.91µs ≈ 218µs 的空转，导致帧率卡在 ~40fps、
-功耗上不去。这个问题**与 PCIe 带宽无关**，属于另一个课题。
+P1XX / CMP mining cards carry one **independent** performance limiter: the
+driver writes to the pushbuffer every batch with
+`method 0x3998 = 0xF0 (240)`, giving 240 × 0.91µs ≈ 218µs of idle spin, which
+pins the framerate at ~40fps and keeps power usage down. This problem has
+**nothing to do with PCIe bandwidth**; it is a separate topic.
 
-**本仓库不提供它的实现。** 需要的话去这两处：
+**This repo does not ship an implementation.** If you need it, see:
 
-- 本作者的 clear-delay 项目：<https://github.com/WJNKAC/nvidia-p106-clear-delay>
-- 上游分析（内核白名单思路）：<https://github.com/dartraiden/NVIDIA-patcher/issues/3>
+- the same author's clear-delay project: <https://github.com/WJNKAC/nvidia-p106-clear-delay>
+- upstream analysis (the kernel-whitelist idea): <https://github.com/dartraiden/NVIDIA-patcher/issues/3>
 
-> ★ 每个 `drivers/<版本>/README.md` 都会重复引用这两个链接 ——
-> 因为看单个版本的人未必会翻到这里。
+> ★ Every `drivers/<version>/README.md` repeats these two links —
+> because someone reading a single version may not browse this far.
 
-它与本目录 `whitelist` 补丁的关系：
+Its relationship with this directory's `whitelist` patch:
 
-| 配置 | 帧时间 | fps | 延迟命令是否生成 |
+| config | frame time | fps | delay commands generated? |
 |---|---|---|---|
-| 都不打 | 52.202 ms | 18.98 | 40+ 条 |
-| **只打 whitelist** | **3.668 ms** | 243.78 | **0 条** |
-| 只打用户态跳转（本项目不提供） | 3.434 ms | 259.79 | 0 条 |
-| 两者都打 | 3.667 ms | 246.64 | 0 条 |
+| no patches | 52.202 ms | 18.98 | 40+ |
+| **whitelist only** | **3.668 ms** | 243.78 | **0** |
+| user-space jump only (not provided by this project) | 3.434 ms | 259.79 | 0 |
+| both | 3.667 ms | 246.64 | 0 |
 
-⇒ **只打 `whitelist` 就够了**：命令**根本不生成**（不是"生成了但跳过"），
-另一个补丁在它之上没有额外收益。
+=> **the `whitelist` patch alone is enough**: the commands are **never
+generated at all** (not "generated but skipped"); the other patch adds no
+benefit on top of it.
 
-这也是本目录保留 `whitelist` 的理由：它和 `gen2` 一样，
-改的都是**驱动/内核模块的身份与策略层**，同一套定位手法，放在一起合理。
-而「用户态 glcore 跳转」属于另一层、另一个课题，这里只引用结论，不放实现。
+That is also why this directory keeps `whitelist`: like `gen2`, it patches the
+**identity/policy layer of the driver or kernel module**, located with the same
+method, so they belong together. The "user-space glcore jump" is a different
+layer and a different topic; only the conclusion is referenced here, no
+implementation.
 
-## Gen2 的额外要求
+## Gen2's extra requirement
 
-Gen2 的 2 字节补丁只做到「驱动不再把速率降回 Gen1」，
-**链路本身还需要有人推上去**（解锁端点声明 + 写 SPEED + 重训）。
+Gen2's 2-byte patch only achieves "the driver no longer drops the speed back
+to Gen1"; **the link itself still needs someone to push it up** (unlock the
+endpoint declaration + write SPEED + retrain).
 
-推送由 `580.178.04/kernel/6.12.113/gen2kr.c` 完成（在 `nv_pci_probe` 返回瞬间做），
-完整流程见 `580.178.04/README.md`。`01-gen2-patch.sh` 只管那个 2 字节补丁。
+The push is done by `580.178.04/kernel/6.12.113/gen2kr.c` (at the instant
+`nv_pci_probe` returns); see `580.178.04/README.md` for the full flow.
+`01-gen2-patch.sh` only handles that 2-byte patch.

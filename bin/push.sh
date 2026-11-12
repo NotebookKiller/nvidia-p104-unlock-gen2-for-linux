@@ -1,101 +1,105 @@
 #!/bin/bash
 # ============================================================
-# push.sh —— 轻量推送：不重载 nvidia，只让设备重新 probe 一次
+# push.sh — lightweight push: no nvidia reload; just re-probe the device once
 #
-# ## 与 20-install.sh 的区别
-#   20-install.sh 会 `rmmod nvidia && modprobe nvidia`，那是为了**让补丁生效**
-#   （改完 .ko 二进制必须重载才读新的）。
+# ## Difference from 20-install.sh
+#   20-install.sh does `rmmod nvidia && modprobe nvidia`, and that exists to
+#   make the patch take effect (a modified .ko binary must be reloaded in
+#   order to be read).
 #
-#   但补丁一旦在 .ko 里（重启后仍在），就**不需要再重载** ——
-#   只需要让设备重新走一遍 `nv_pci_probe`，让 gen2kr 的 kretprobe 命中一次。
+#   But once the patch is inside the .ko (it survives a reboot), **no reload
+#   is needed anymore** --
+#   just let the device walk through `nv_pci_probe` once more so gen2kr's
+#   kretprobe fires once.
 #
-#   本脚本就是那条最短路径：
-#       insmod gen2kr  →  unbind  →  bind   →  等链路到 Gen2
+#   This script is exactly that shortest path:
+#       insmod gen2kr  ->  unbind  ->  bind   ->  wait for the link to reach Gen2
 #
-# ## 前提
-#   · 补丁已打（patch_no_gen1.py check 显示已打补丁）
-#   · nvidia 已加载（正常开机就是）
+# ## Preconditions
+#   · patch applied (patch_no_gen1.py check reports patched)
+#   · nvidia loaded (that is the normal post-boot state)
 #
-# ## 实测（reports/201）
+# ## Measured (reports/201)
 #   ```
-#   [fast] 直接写 SPEED=1，原 20045800 → 20045800
-#   [push] 起始 cap2=00000006 config=c0b48d00 lnkcfg0=20045800
-#   [push] 写完 cap2=00000006 config=c0b4ad00 lnkcfg0=20045800
-#   ★ SUCCESS Gen2 LNKSTA=1042（第 1 次）
+#   [fast] direct SPEED=1 write, original 20045800 -> 20045800
+#   [push] start cap2=00000006 config=c0b48d00 lnkcfg0=20045800
+#   [push] after write cap2=00000006 config=c0b4ad00 lnkcfg0=20045800
+#   ★ SUCCESS Gen2 LNKSTA=1042 (attempt 1)
 #   ```
-#   → 链路 5GT/s，pinned H2D 1.561 / D2H 1.708 GB/s
+#   -> link 5GT/s, pinned H2D 1.561 / D2H 1.708 GB/s
 #
-# 用法：
+# Usage:
 #   sudo bash bin/push.sh
-#   sudo bash bin/push.sh --no-insmod    # gen2kr 已在内存里，只做 unbind/bind
+#   sudo bash bin/push.sh --no-insmod    # gen2kr already in memory; only unbind/bind
 # ============================================================
 set -u
 
 # ============================================================
-# 1. 变量
+# 1. Variables
 # ============================================================
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-DO_INSMOD=1             # 1 = 先 rmmod 再 insmod（清 triggered 标志）
-FORCE=0                 # 1 = --force，跳过链路状态前置检查
-WAIT_SECONDS=20         # 等链路升到 Gen2 的最长时间
+DO_INSMOD=1             # 1 = rmmod first, then insmod (clears the triggered flag)
+FORCE=0                 # 1 = --force, skip the link-state pre-check
+WAIT_SECONDS=20         # how long to wait for the link to rise to Gen2
 
-# 退出码
-EXIT_PRECHECK=1         # 前置条件不满足
-EXIT_PUSH_FAIL=2        # 推送未成功
+# Exit codes
+EXIT_PRECHECK=1         # preconditions not met
+EXIT_PUSH_FAIL=2        # push did not succeed
 
 # ============================================================
-# 2. 函数
+# 2. Functions
 # ============================================================
 
-# 解析命令行参数
+# Parse command-line arguments
 parse_args() {
     case "${1:-}" in
         --no-insmod) DO_INSMOD=0 ;;
         --force)     FORCE=1 ;;
         "")          ;;
         *)
-            err "未知参数 $1"
-            echo "   用法: sudo bash bin/push.sh [--no-insmod] [--force]"
+            err "unknown argument $1"
+            echo "   usage: sudo bash bin/push.sh [--no-insmod] [--force]"
             exit 2
             ;;
     esac
 }
 
-# 前置检查：nvidia 已加载 + 补丁在位
+# Preconditions: nvidia loaded + patch in place
 check_preconditions() {
     local patch_state
 
-    hdr "0. 前置检查"
+    hdr "0. Preconditions"
 
     if ! lsmod | grep -q '^nvidia '; then
-        err "nvidia 未加载 —— 先 modprobe nvidia（或用 20-install.sh）"
+        err "nvidia is not loaded -- modprobe nvidia first (or use 20-install.sh)"
         return 1
     fi
-    ok "nvidia 已加载（不会动它）"
+    ok "nvidia is loaded (we will not touch it)"
 
     patch_state="$(python3 "${PKG_ROOT}/bin/patch_no_gen1.py" check 2>/dev/null \
-                   | grep -oE '未打补丁|已打补丁')"
+                   | grep -oE '\[not patched\]|\[patched\]')"
 
     case "${patch_state}" in
-        已打补丁)
-            ok "补丁在位" ;;
-        未打补丁)
-            err "补丁不在 —— 那 push 上去也会被驱动降回来"
-            echo "     先跑：sudo bash bin/20-install.sh   （它会 apply + 重载）"
+        "[patched]")
+            ok "patch is in place" ;;
+        "[not patched]")
+            err "patch is missing -- a push would just get downgraded by the driver again"
+            echo "     run first: sudo bash bin/20-install.sh   (it applies + reloads)"
             return 1 ;;
         *)
-            warn "无法判定补丁状态，继续但可能无效" ;;
+            warn "cannot determine the patch state; continuing, but it may not work" ;;
     esac
     return 0
 }
 
-# 链路状态前置检查（★ 只在「干净起点」才推送）
+# Link-state pre-check (★ push only from a "clean starting point")
 #
-# 干净起点 = CAP2 0x0002 + TLS 1（原厂未解锁）。
-# 脏状态（例如 CAP2=0x0006 但 TLS=3，或 0x8841C 处于写入后的中间态）下继续推送，
-# 会把 0x8841C 写坏、产生 TLS=3，只能冷启动恢复。
-# 已经是 Gen2 就不要重复推。
+# Clean starting point = CAP2 0x0002 + TLS 1 (factory-locked).
+# Pushing from a dirty state (e.g. CAP2=0x0006 but TLS=3, or 0x8841C sitting in
+# a post-write intermediate state) corrupts the 0x8841C write and produces
+# TLS=3, which only a cold boot recovers from.
+# If the link is already Gen2, do not push again.
 check_link_state() {
     local out cap tls spd
     out="$(read_regs)"
@@ -103,122 +107,124 @@ check_link_state() {
     tls="$(printf '%s' "${out}" | grep -oE 'TLS=[0-9]+'       | cut -d= -f2)"
     spd="$(printf '%s' "${out}" | grep -oE 'SPEED=[0-9]+'     | cut -d= -f2)"
 
-    hdr "0b. 链路状态"
+    hdr "0b. Link state"
     echo "   ${out}"
 
-    # 已在 Gen2 → 不用推
+    # Already Gen2 -> nothing to push
     if [ "${cap}" = "0x0006" ] && [ "${tls}" = "2" ] && [ "${spd}" = "1" ]; then
-        ok "链路已是 Gen2，无需推送"
+        ok "link is already Gen2; no push needed"
         return 9
     fi
 
-    # 干净起点
+    # Clean starting point
     if [ "${cap}" = "0x0002" ] && [ "${tls}" = "1" ]; then
-        ok "干净起点（CAP2=0x0002 TLS=1）"
+        ok "clean starting point (CAP2=0x0002 TLS=1)"
         return 0
     fi
 
-    # 其余一律视为脏状态
-    err "不是干净起点，拒绝推送"
-    echo "     期待：CAP2=0x0002 + TLS=1（原厂）或 CAP2=0x0006 + TLS=2 + SPEED=1（已 Gen2）"
-    echo "     实际：CAP2=${cap:-?} TLS=${tls:-?} SPEED=${spd:-?}"
-    echo "     ${C_R}脏状态下推送会写坏 0x8841C、产生 TLS=3，只能冷启动恢复。${C_0}"
-    echo "     建议：先整机重启，再从这个状态起推。"
+    # Everything else is treated as a dirty state
+    err "not a clean starting point; refusing to push"
+    echo "     expected: CAP2=0x0002 + TLS=1 (factory) or CAP2=0x0006 + TLS=2 + SPEED=1 (already Gen2)"
+    echo "     actual:   CAP2=${cap:-?} TLS=${tls:-?} SPEED=${spd:-?}"
+    echo "     ${C_R}pushing from a dirty state corrupts 0x8841C and produces TLS=3; only a cold boot recovers.${C_0}"
+    echo "     recommended: reboot the whole machine first, then start the push from there."
     if [ "${FORCE}" = "1" ]; then
-        warn "--force 已指定，仍然继续（风险自负）"
+        warn "--force was given; continuing anyway (at your own risk)"
         return 0
     fi
-    echo "     确实要跳过检查：加 --force"
+    echo "     really want to skip the check: pass --force"
     return 1
 }
 
-# 确保 gen2kr 在内存里，且 triggered 标志是干净的
-#   gen2kr 的 init 只挂 kretprobe，本身不推送；
-#   但若旧实例已在内存里，triggered 可能已被置位 → push 不会再触发，
-#   所以默认先 rmmod 再 insmod。
+# Make sure gen2kr is in memory with a clean triggered flag
+#   gen2kr's init only attaches the kretprobe; it does not push by itself.
+#   But if an old instance is already in memory, triggered may already be set
+#   -> the push would not fire again, so the default is rmmod first, then insmod.
 ensure_gen2kr_loaded() {
-    hdr "1. gen2kr（只挂 kretprobe，本身不推送）"
+    hdr "1. gen2kr (only attaches a kretprobe; it does not push by itself)"
 
     if lsmod | grep -q '^gen2kr'; then
-        echo "   已在内存里"
+        echo "   already in memory"
         if [ "${DO_INSMOD}" = "1" ]; then
-            rmmod gen2kr 2>/dev/null && echo "   已重载以清 triggered 标志"
+            rmmod gen2kr 2>/dev/null && echo "   reloaded to clear the triggered flag"
         fi
     fi
 
     if ! lsmod | grep -q '^gen2kr'; then
-        insmod "${BUILD_DIR}/gen2kr.ko" || { err "insmod 失败"; return 1; }
-        echo "   已加载 ${BUILD_DIR}/gen2kr.ko"
+        insmod "${BUILD_DIR}/gen2kr.ko" || { err "insmod failed"; return 1; }
+        echo "   loaded ${BUILD_DIR}/gen2kr.ko"
     fi
 
     sleep 1
     return 0
 }
 
-# 检查是否有进程占用 GPU
+# Check whether any process is holding the GPU
 #
-# ★ 2026-10-29 事故：GPU 被浏览器占用时写 unbind 不会失败、也不会返回，
-#   而是卡在 device_release_driver_internal 里，进程落入 D/R 状态、
-#   kill -9 无效，只能整机重启。所以这一步是硬阻断，不是警告。
+# ★ 2026-10-29 incident: when the GPU is held by a browser, writing unbind does
+#   not fail and does not return either -- it wedges inside
+#   device_release_driver_internal, processes land in D/R state, kill -9 is
+#   useless, and only a full reboot helps. That is why this step is a hard
+#   block, not a warning.
 check_gpu_idle() {
     local holders
 
     holders="$(fuser /dev/nvidia* 2>/dev/null | tr -s ' ')"
     [ -z "${holders}" ] && return 0
 
-    err "有进程正在使用 GPU，unbind 会卡死内核（只能重启）"
-    echo "     占用者："
+    err "a process is using the GPU; unbind would wedge the kernel (reboot only)"
+    echo "     holders:"
     fuser -v /dev/nvidia* 2>&1 | sed 's/^/       /'
     echo
-    echo "     请先关掉这些程序（浏览器 / Electron 应用最常见），然后重试。"
-    echo "     ⚠ 实测 unbind 会停在 device_lock 不动，进程落入 D 状态、kill -9 无效。"
+    echo "     close these programs first (browsers / Electron apps are the usual culprits), then retry."
+    echo "     ⚠ measured: unbind stops dead in device_lock; processes land in D state and kill -9 does nothing."
     return 1
 }
 
-# 通过 unbind/bind 触发一次 nv_pci_probe，让 kretprobe 命中
+# Trigger one nv_pci_probe via unbind/bind so the kretprobe fires
 trigger_probe() {
-    hdr "2. 触发一次 probe（kretprobe 在这里命中）"
+    hdr "2. Triggering one probe (the kretprobe fires here)"
 
     if [ ! -w /sys/bus/pci/drivers/nvidia/unbind ]; then
-        err "无权写 unbind —— 需要 root"
+        err "cannot write unbind -- root required"
         return 1
     fi
 
     check_gpu_idle || return 1
 
     echo "   unbind ..."
-    echo "${DEV_BDF}" > /sys/bus/pci/drivers/nvidia/unbind || { err "unbind 失败"; return 1; }
+    echo "${DEV_BDF}" > /sys/bus/pci/drivers/nvidia/unbind || { err "unbind failed"; return 1; }
     sleep 1
 
     echo "   bind   ..."
-    echo "${DEV_BDF}" > /sys/bus/pci/drivers/nvidia/bind || { err "bind 失败"; return 1; }
+    echo "${DEV_BDF}" > /sys/bus/pci/drivers/nvidia/bind || { err "bind failed"; return 1; }
     return 0
 }
 
-# 等链路升到 Gen2，失败时打印排查信息
+# Wait for the link to rise to Gen2; on failure print troubleshooting info
 wait_for_gen2() {
-    hdr "3. 等链路升到 Gen2（最多 ${WAIT_SECONDS}s）"
+    hdr "3. Waiting for the link to rise to Gen2 (up to ${WAIT_SECONDS}s)"
 
     if wait_gen2 "${WAIT_SECONDS}"; then
-        ok "链路 = Gen2    $(read_regs)"
+        ok "link = Gen2    $(read_regs)"
         return 0
     fi
 
-    warn "未升上去（$(read_regs)）"
-    echo "   gen2kr 日志："
+    warn "did not rise ($(read_regs))"
+    echo "   gen2kr log:"
     dmesg | grep -i gen2kr | tail -10 | sed 's/^/     /'
     echo
-    echo "   排查见 docs/故障排查.md"
-    echo "   若 CAP2 恒 0x0002 + TLS 恒 1 + 连续失败 ⇒ 整机重启，不要再试"
+    echo "   see docs/troubleshooting.md"
+    echo "   if CAP2 stays pinned at 0x0002 + TLS stays 1 + failures keep repeating => reboot the whole machine; do not keep retrying"
     return 1
 }
 
-# 打印结束语
+# Print the closing message
 show_footer() {
     echo
     echo "======================================================"
-    echo " 完成。nvidia 模块未被卸载/重载。"
-    echo " 验证带宽： build/bwtest2 512 15 | grep pinned   （应 ~1.56/1.71）"
+    echo " Done. The nvidia module was never unloaded/reloaded."
+    echo " Verify bandwidth: build/bwtest2 512 15 | grep pinned   (should be ~1.56/1.71)"
     echo "======================================================"
 }
 
@@ -229,12 +235,12 @@ main() {
     parse_args "$@"
 
     need_root
-    ensure_build check || { err "探针未编译 → bash bin/build.sh"; exit "${EXIT_PRECHECK}"; }
+    ensure_build check || { err "probe not compiled -> bash bin/build.sh"; exit "${EXIT_PRECHECK}"; }
 
     echo "======================================================"
-    echo " 轻量推送（不重载 nvidia）"
+    echo " Lightweight push (no nvidia reload)"
     echo "======================================================"
-    echo " 起点：$(read_regs)"
+    echo " starting point: $(read_regs)"
 
     check_preconditions      || exit "${EXIT_PRECHECK}"
 
@@ -242,7 +248,7 @@ main() {
     check_link_state || rc=$?
     case "${rc}" in
         0)  ;;
-        9)  show_footer; exit 0 ;;          # 已经是 Gen2
+        9)  show_footer; exit 0 ;;          # already Gen2
         *)  exit "${EXIT_PRECHECK}" ;;
     esac
 

@@ -1,27 +1,33 @@
 #!/bin/bash
-# soak.sh —— 长跑稳定性验证（默认 30 分钟）
+# soak.sh — long-run stability verification (30 minutes by default)
 #
-# 目的（reports/197 §8 待办）
-#   守卫已验证单次恢复 3.84s、带宽 1.56/1.71。但"连续几十次降级-恢复后是否退化"
-#   没测过。本脚本循环做：
-#       新建 CUDA 上下文（触发降级）→ 等恢复 → 记录耗时 → 定期测带宽
-#   并在每轮检查：
-#       · LNKSTA 是否真的回到 Gen2
-#       · 设备是否仍应答（连续 20 次 0xffffffff 才判死）
-#       · 是否新出现 Xid
-#       · 恢复耗时是否随轮次增长（退化趋势）
+# Purpose (reports/197 §8 backlog)
+#   The guard has been verified for a single recovery in 3.84s and bandwidth
+#   1.56/1.71. But "does performance degrade after dozens of downgrade-recover
+#   cycles" was never measured. This script loops over:
+#       create a CUDA context (triggers a downgrade) -> wait for recovery ->
+#       record the duration -> measure bandwidth periodically
+#   and checks on every round:
+#       · whether LNKSTA really returned to Gen2
+#       · whether the device still answers (only 20 consecutive 0xffffffff
+#         readings count as dead)
+#       · whether new Xids appeared
+#       · whether the recovery time grows over rounds (a degradation trend)
 #
-# ★ 只用只读 MMIO + gen2kr 的内部动作，**不做任何用户态 MMIO 写**
-#   （reports/197：用户态写 0x8C040 在链路动态时 2/2 打挂设备）
+# ★ Uses read-only MMIO + gen2kr's own actions only; **no user-space MMIO
+#   writes at all**
+#   (reports/197: a user-space write to 0x8C040 killed 2/2 devices while the
+#   link was dynamic)
 #
-# 用法：bash soak.sh [分钟数] [每轮间隔秒]
-# 日志：/tmp/log-soak-<时间>.log（原因见下方注释）
+# Usage: bash soak.sh [minutes] [per-round gap seconds]
+# Log: /tmp/log-soak-<time>.log (reason explained in the comment below)
 set -u
 MIN="${1:-30}"
 GAP="${2:-3}"
 D="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-# ★ 日志默认写 /tmp：本脚本用 root 跑（读 /dev/mem），若仓库在 NFS 上
-#   （root_squash），root 写不进仓库目录。跑完把日志拷回 logs/ 即可。
+# ★ The log goes to /tmp by default: this script runs as root (it reads
+#   /dev/mem), and if the repo sits on NFS (root_squash), root cannot write
+#   into the repo directory. Copy the log back into logs/ when done.
 LOGF="/tmp/log-soak-$(date +%Y%m%d-%H%M%S).log"
 
 lnk() {
@@ -41,7 +47,7 @@ except Exception:
 PY
 }
 
-# 连续 20 次 0xffffffff 才判死（重训瞬态是常态）
+# only 20 consecutive 0xffffffff readings count as dead (retrain transients are normal)
 alive() {
   local bad=0
   for i in $(seq 1 20); do
@@ -54,17 +60,17 @@ alive() {
 
 log() { echo "$*" | tee -a "$LOGF"; }
 
-log "================ soak 开始 $(date '+%F %T') ================"
-log "时长 ${MIN} 分钟，每轮间隔 ${GAP}s"
-log "内核: $(uname -r)   gen2kr 参数:"
+log "================ soak start $(date '+%F %T') ================"
+log "duration ${MIN} minutes, per-round gap ${GAP}s"
+log "kernel: $(uname -r)   gen2kr parameters:"
 for p in stage_gap_ms debounce_cnt retrain_min_ms speed_settle_ms guard_period_ms allow_busy_retrain; do
   log "  $p = $(cat /sys/module/gen2kr/parameters/$p 2>/dev/null || echo N/A)"
 done
 log ""
-printf '%-5s %-9s %-8s %-7s %-6s %-6s %s\n' 轮次 时刻 恢复耗时 链路 SPEED LCAP2 Xid | tee -a "$LOGF"
+printf '%-5s %-9s %-8s %-7s %-6s %-6s %s\n' round time recover link SPEED LCAP2 Xid | tee -a "$LOGF"
 
 XID0=$(dmesg | grep -c "Xid" || true)
-log "起始 Xid 计数: $XID0"
+log "starting Xid count: $XID0"
 log ""
 
 END=$(( $(date +%s) + MIN * 60 ))
@@ -76,7 +82,7 @@ SUMT=0
 while [ "$(date +%s)" -lt "$END" ]; do
   N=$((N + 1))
 
-  # 起点必须是 Gen2，否则先等
+  # the starting point must be Gen2, otherwise wait first
   ready=0
   for i in $(seq 1 40); do
     read -r SP _ _ <<<"$(lnk)"
@@ -84,17 +90,17 @@ while [ "$(date +%s)" -lt "$END" ]; do
     sleep 0.25
   done
   if [ "$ready" = "0" ]; then
-    log "$(printf '%-5s %-9s %-8s %-7s' "$N" "$(date +%H:%M:%S)" "-" "起点非Gen2")"
+    log "$(printf '%-5s %-9s %-8s %-7s' "$N" "$(date +%H:%M:%S)" "-" "not Gen2 at start")"
     FAIL=$((FAIL + 1))
-    if ! alive; then log "  ★★ 设备失联，终止长跑"; break; fi
+    if ! alive; then log "  ★★ device lost; aborting the soak"; break; fi
     sleep "$GAP"; continue
   fi
 
-  # 触发降级并计时
+  # trigger a downgrade and time it
   T0=$(date +%s.%N)
   "$D/build/minictx" 1 >/dev/null 2>&1
   GOT=""
-  for i in $(seq 1 250); do    # 最多 50s
+  for i in $(seq 1 250); do    # up to 50s
     read -r SP SD CP <<<"$(lnk)"
     if [ "$SP" = "2" ]; then
       GOT=$(python3 -c "print(f'{$(date +%s.%N)-$T0:.2f}')")
@@ -102,7 +108,7 @@ while [ "$(date +%s)" -lt "$END" ]; do
     fi
     if [ "$SP" = "15" ]; then
       if ! alive; then
-        log "  ★★ 第 $N 轮设备失联（连续 20 次 ffffffff），终止"
+        log "  ★★ round $N: device lost (20 consecutive ffffffff); aborting"
         GOT="DEAD"; break
       fi
     fi
@@ -122,7 +128,7 @@ while [ "$(date +%s)" -lt "$END" ]; do
     MAXT=$(python3 -c "print(max($MAXT, $GOT))")
   fi
 
-  # 每 10 轮测一次带宽（用 256MB，比 128 更不容易落在恢复窗口）
+  # measure bandwidth every 10 rounds (256MB: less likely to land inside the recovery window than 128)
   if [ $((N % 10)) -eq 0 ]; then
     for i in $(seq 1 40); do
       read -r SP _ _ <<<"$(lnk)"
@@ -130,22 +136,22 @@ while [ "$(date +%s)" -lt "$END" ]; do
       sleep 0.25
     done
     BW=$("$D/build/bwtest2" 256 8 2>&1 | grep -E "pinned" | head -1)
-    log "      [第 $N 轮带宽] $BW"
+    log "      [round $N bandwidth] $BW"
   fi
 
   sleep "$GAP"
 done
 
 log ""
-log "================ 汇总 ================"
+log "================ summary ================"
 OK=$((N - FAIL))
-log "总轮次 $N   成功 $OK   失败 $FAIL"
+log "total rounds $N   succeeded $OK   failed $FAIL"
 if [ "$OK" -gt 0 ]; then
-  log "平均恢复 $(python3 -c "print(f'{$SUMT/$OK:.2f}')")s   最慢 ${MAXT}s"
+  log "average recovery $(python3 -c "print(f'{$SUMT/$OK:.2f}')")s   slowest ${MAXT}s"
 fi
 XIDF=$(dmesg | grep -c "Xid" || true)
-log "Xid: 起始 $XID0 → 结束 $XIDF（新增 $((XIDF - XID0))）"
+log "Xid: start $XID0 -> end $XIDF (new: $((XIDF - XID0)))"
 read -r SP SD CP <<<"$(lnk)"
-log "最终: LNKSTA[3:0]=$SP  SPEED=$SD  LCAP2=$CP"
-log "结束于 $(date '+%F %T')"
-log "日志: $LOGF"
+log "final: LNKSTA[3:0]=$SP  SPEED=$SD  LCAP2=$CP"
+log "ended at $(date '+%F %T')"
+log "log: $LOGF"

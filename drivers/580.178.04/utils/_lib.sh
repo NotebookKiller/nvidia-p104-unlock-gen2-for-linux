@@ -1,43 +1,48 @@
 #!/bin/bash
 # ============================================================
-# _lib.sh —— drivers/<版本>/ 下脚本的公共部分
+# _lib.sh — the common part of the scripts under drivers/<version>/
 #
-# 被 00-whitelist.sh / 01-gen2-patch.sh / 02-gen2-push.sh source。
-# 只放「通用」的东西：路径、颜色、权限、寄存器读取、GPU 占用检查、模块编译。
-# 具体业务（改哪个字节、怎么推链路）在各脚本里。
+# Sourced by 00-whitelist.sh / 01-gen2-patch.sh / 02-gen2-push.sh.
+# Only holds the "generic" things: paths, colors, permissions, register
+# reads, the GPU-busy check, module building.
+# Business specifics (which bytes to change, how to push the link)
+# live in the individual scripts.
 #
-# 设计约束（踩过的坑）：
-#   · 不用 $(( )) 处理 >2^63 的数（dash 报 Illegal number）→ 交给 python
-#   · 读 /dev/mem 必须 O_RDWR（O_RDONLY + PROT_WRITE 会 PermissionError）
+# Design constraints (pitfalls already hit):
+#   · do not use $(( )) for numbers >2^63 (dash reports "Illegal number")
+#     -> hand it to python
+#   · reading /dev/mem must use O_RDWR (O_RDONLY + PROT_WRITE gives
+#     PermissionError)
 # ============================================================
 
 # ============================================================
-# 1. 路径
+# 1. Paths
 # ============================================================
-# _lib.sh 现在在 drivers/<版本>/utils/ 下
-UTILS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # drivers/<版本>/utils
-VER_DIR="$(cd "${UTILS_DIR}/.." && pwd)"                    # drivers/<版本>
-PKG_ROOT="$(cd "${VER_DIR}/../.." && pwd)"                  # 仓库根
+# _lib.sh now lives in drivers/<version>/utils/
+UTILS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # drivers/<version>/utils
+VER_DIR="$(cd "${UTILS_DIR}/.." && pwd)"                    # drivers/<version>
+PKG_ROOT="$(cd "${VER_DIR}/../.." && pwd)"                  # repo root
 OFFSETS_FILE="${VER_DIR}/offsets.sh"
 PATCH_PY="${UTILS_DIR}/_patch.py"
 
 KVER="$(uname -r)"
-KVER_SHORT="${KVER%%+*}"                                    # 6.12.113+deb13 → 6.12.113
-KERNEL_SRC_DIR="${VER_DIR}/kernel/${KVER_SHORT}"            # 模块源码目录
+KVER_SHORT="${KVER%%+*}"                                    # 6.12.113+deb13 -> 6.12.113
+KERNEL_SRC_DIR="${VER_DIR}/kernel/${KVER_SHORT}"            # module sources directory
 
 KO="/lib/modules/${KVER}/updates/dkms/nvidia.ko"
 
-# ★ 目标设备 BDF 自动发现（单一来源：utils/bdf.sh）
-#   不要在这里硬编码 01:00.0 —— 多卡机上会操作错卡。
-#   可用 TARGET_BDF / TARGET_IDS 覆盖。
+# ★ Target device BDF auto-discovery (single source: utils/bdf.sh)
+#   Do not hardcode 01:00.0 here — on a multi-card machine it would
+#   operate the wrong card.
+#   Overridable with TARGET_BDF / TARGET_IDS.
 # shellcheck source=./bdf.sh
 source "${UTILS_DIR}/bdf.sh"
 
-# 驱动源码目录（whitelist 补丁的输入）
+# Driver sources directory (input of the whitelist patch)
 NVKERNEL_DIR="/usr/src/nvidia-580.178.04"
 
 # ============================================================
-# 2. 输出
+# 2. Output
 # ============================================================
 if [ -t 1 ]; then
     C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[36m'; C_0=$'\033[0m'
@@ -49,7 +54,7 @@ warn() { echo "${C_Y}⚠${C_0} $*"; }
 err()  { echo "${C_R}✗${C_0} $*"; }
 hdr()  { echo; echo "${C_B}── $* ──${C_0}"; }
 
-# 分节大标题
+# Big section title
 section() {
     echo
     echo "======================================================"
@@ -58,13 +63,13 @@ section() {
 }
 
 need_root() {
-    [ "$(id -u)" = "0" ] || { err "需要 root：sudo bash $0 $*"; exit 1; }
+    [ "$(id -u)" = "0" ] || { err "root required: sudo bash $0 $*"; exit 1; }
 }
 
-# 加载偏移定义（offsets.sh 只定义变量，不做任何事）
+# Load the offset definitions (offsets.sh only defines variables, does nothing)
 load_offsets() {
     if [ ! -f "${OFFSETS_FILE}" ]; then
-        err "找不到 ${OFFSETS_FILE}"
+        err "cannot find ${OFFSETS_FILE}"
         exit 1
     fi
     # shellcheck source=offsets.sh
@@ -72,7 +77,7 @@ load_offsets() {
 }
 
 # ============================================================
-# 3. 寄存器读取（只读，用于判定状态）
+# 3. Register reads (read-only, used to judge state)
 # ============================================================
 _r() {
 python3 - "$1" <<'PY'
@@ -90,7 +95,7 @@ except Exception:
 PY
 }
 
-# 一行摘要：CAP2=0x0006 LNKSTA=2 ...
+# One-line summary: CAP2=0x0006 LNKSTA=2 ...
 read_regs() {
 python3 - <<'PY'
 import mmap, os, struct
@@ -110,17 +115,17 @@ except Exception:
 PY
 }
 
-# 当前链路速率（唯一可信判据：LNKSTA[3:0]）
+# Current link speed (the only trustworthy criterion: LNKSTA[3:0])
 cur_speed() {
     local s
     s="$(_r 0x88088)"
     python3 -c "print((${s:-0}>>16)&0xF)" 2>/dev/null || echo 0
 }
 
-# 是否已是 Gen2
+# Whether the link is already Gen2
 is_gen2() { [ "$(cur_speed)" = "2" ]; }
 
-# 等链路升到 Gen2，参数为最长秒数
+# Wait for the link to reach Gen2; the argument is the maximum number of seconds
 wait_gen2() {
     local n="${1:-20}" i
     for i in $(seq 1 $((n * 5))); do
@@ -131,49 +136,53 @@ wait_gen2() {
 }
 
 # ============================================================
-# 4. 安全检查
+# 4. Safety checks
 # ============================================================
 
-# GPU 是否空闲
+# Is the GPU idle
 #
-# ★ 2026-10-29 事故：GPU 被浏览器占用时写 unbind 不会失败、也不会返回，
-#   而是卡在 device_release_driver_internal 里，进程落入 D/R 状态、
-#   kill -9 无效，只能整机重启。所以这是硬阻断。
+# ★ 2026-10-29 incident: when the GPU was held by a browser, writing
+#   unbind did not fail and did not return — it wedged inside
+#   device_release_driver_internal, processes fell into D/R state,
+#   kill -9 did nothing, and only a full reboot recovered. So this is a
+#   hard block.
 check_gpu_idle() {
     local holders
     holders="$(fuser /dev/nvidia* 2>/dev/null | tr -s ' ')"
     [ -z "${holders}" ] && return 0
 
-    err "有进程正在使用 GPU，unbind 会卡死内核（只能重启）"
-    echo "     占用者："
+    err "processes are using the GPU; unbind would wedge the kernel (only a reboot recovers)"
+    echo "     holders:"
     fuser -v /dev/nvidia* 2>&1 | sed 's/^/       /'
     echo
-    echo "     请先关掉这些程序（浏览器 / Electron 应用最常见），然后重试。"
-    echo "     ⚠ 实测 unbind 会停在 device_lock 不动，进程落入 D 状态、kill -9 无效。"
+    echo "     Close those programs first (browsers / Electron apps are the most common), then retry."
+    echo "     ⚠ Observed: unbind stalls in device_lock without moving, processes fall into D state, kill -9 does nothing."
     return 1
 }
 
 # ============================================================
-# 5. 内核模块
+# 5. Kernel module
 # ============================================================
 
-# 模块目录对应哪套内核（用于提示）
+# Which kernel the module directory corresponds to (used for hints)
 kmod_kernel_version() {
     basename "${KERNEL_SRC_DIR}" 2>/dev/null || echo "?"
 }
 
-# 模块是否已加载
+# Whether the module is loaded
 kmod_loaded() { lsmod | grep -q '^gen2kr'; }
 
-# 编译模块。成功后 .ko 在 ${KERNEL_SRC_DIR}/gen2kr.ko
-# 该用哪个用户编译内核模块
+# Build the module. When successful the .ko is at ${KERNEL_SRC_DIR}/gen2kr.ko
+# Which user should build a kernel module
 #
-# ★ 这是踩过的坑（2026-10-29）：脚本整体要 root（insmod / 写 sysfs），
-#   但**编译不能用 root** —— 若仓库在 NFS 上（root_squash），
-#   root 写不进 .gen2kr.o.d，报「权限不够」而编译失败。
+# ★ Pitfall already hit (2026-10-29): the script as a whole needs root
+#   (insmod / writing sysfs), but **the build must not run as root** —
+#   if the repo sits on NFS (root_squash), root cannot write
+#   .gen2kr.o.d, and the build fails with "permission denied".
 #
-# 所以：非 root 就直接用当前用户；是 root 就降权到 SUDO_USER。
-# 拿不到 SUDO_USER（比如 su - 进来的）则返回空，由调用方报错。
+# So: if not root, just use the current user; if root, drop privileges
+# to SUDO_USER. If SUDO_USER is unavailable (e.g. logged in via `su -`),
+# return empty and let the caller report the error.
 build_user() {
     if [ "$(id -u)" != "0" ]; then
         id -un
@@ -186,7 +195,8 @@ build_user() {
     echo ""
 }
 
-# 以指定用户执行命令（root 时降权；本来就不是 root 就直跑）
+# Run a command as the given user (root drops privileges; if not root
+# in the first place, just run it)
 run_as() {
     local user="$1"; shift
     if [ "${user}" = "$(id -un)" ]; then
@@ -197,46 +207,46 @@ run_as() {
 }
 
 build_kmod() {
-    hdr "编译内核模块"
+    hdr "build the kernel module"
 
     if [ ! -d "${KERNEL_SRC_DIR}" ]; then
-        err "找不到模块源码目录：${KERNEL_SRC_DIR}"
-        echo "    期望: kernel/<内核版本>/gen2kr.c"
-        echo "    仓库里现有的："
+        err "cannot find the module sources directory: ${KERNEL_SRC_DIR}"
+        echo "    expected: kernel/<kernel version>/gen2kr.c"
+        echo "    existing in the repo:"
         ls -1 "${VER_DIR}/kernel/" 2>/dev/null | sed 's/^/      /'
         return 1
     fi
-    echo "   源码目录: kernel/$(basename "${KERNEL_SRC_DIR}")"
+    echo "   sources directory: kernel/$(basename "${KERNEL_SRC_DIR}")"
 
     local dir_kver
     dir_kver="$(kmod_kernel_version)"
     if [ "${dir_kver}" != "${KVER_SHORT}" ]; then
-        warn "该目录记录的验证内核是 ${dir_kver}，当前是 ${KVER_SHORT}"
-        echo "     源码用稳定 API 通常能编过，但产物未经该内核验证"
+        warn "the kernel verified in that directory is ${dir_kver}; the current one is ${KVER_SHORT}"
+        echo "     The sources use stable APIs and usually compile, but the artifact is unverified on that kernel"
     fi
 
     if [ ! -d "/lib/modules/${KVER}/build" ]; then
-        err "缺少内核头：/lib/modules/${KVER}/build"
-        echo "    安装：sudo apt install linux-headers-${KVER}"
+        err "kernel headers missing: /lib/modules/${KVER}/build"
+        echo "    install with: sudo apt install linux-headers-${KVER}"
         return 1
     fi
 
-    # ★ 编译用户：不能用 root（NFS root_squash 写不进 .gen2kr.o.d）
+    # ★ Build user: must not be root (NFS root_squash cannot write .gen2kr.o.d)
     local cuser
     cuser="$(build_user)"
     if [ -z "${cuser}" ]; then
-        err "当前是 root，但拿不到 SUDO_USER，不知道该用哪个用户编译"
-        echo "    两种办法："
-        echo "      A) 用普通用户跑: bash 02-gen2-push.sh build"
-        echo "      B) 用 sudo 重新跑本脚本: sudo bash 02-gen2-push.sh start"
+        err "currently root but SUDO_USER is unavailable; do not know which user to build as"
+        echo "    two options:"
+        echo "      A) run as a normal user: bash 02-gen2-push.sh build"
+        echo "      B) re-run via sudo: sudo bash 02-gen2-push.sh start"
         return 1
     fi
     if [ "${cuser}" != "$(id -un)" ]; then
-        echo "   编译身份: ${cuser}（当前是 root，降权编译 —— root 编会写不进产物）"
+        echo "   build identity: ${cuser} (currently root; dropping privileges to build — building as root cannot write the artifact)"
     fi
 
-    # ① 先在当前身份下清掉旧产物
-    #    （若之前 root 编过，产物属主是 root，只有 root 删得掉）
+    # ① First clean the old artifacts under the current identity
+    #    (if root built before, the artifacts are root-owned and only root can remove them)
     rm -f "${KERNEL_SRC_DIR}"/gen2kr.o \
           "${KERNEL_SRC_DIR}"/gen2kr.ko \
           "${KERNEL_SRC_DIR}"/gen2kr.mod \
@@ -248,41 +258,41 @@ build_kmod() {
           "${KERNEL_SRC_DIR}"/Module.symvers \
           "${KERNEL_SRC_DIR}"/modules.order 2>/dev/null || true
 
-    # ② 目录本身得让 cuser 可写
+    # ② The directory itself must be writable by cuser
     if [ "${cuser}" != "$(id -un)" ]; then
         chown "${cuser}" "${KERNEL_SRC_DIR}" 2>/dev/null || true
     fi
     if ! run_as "${cuser}" test -w "${KERNEL_SRC_DIR}"; then
-        err "用户 ${cuser} 对 ${KERNEL_SRC_DIR} 没有写权限"
-        echo "    修一下属主：sudo chown -R ${cuser}:${cuser} ${VER_DIR}"
+        err "user ${cuser} has no write permission on ${KERNEL_SRC_DIR}"
+        echo "    fix the ownership: sudo chown -R ${cuser}:${cuser} ${VER_DIR}"
         return 1
     fi
 
-    # ③ 降权编译
+    # ③ Build with dropped privileges
     local log
     log="$(mktemp)"
     if run_as "${cuser}" make -C "/lib/modules/${KVER}/build" \
                M="${KERNEL_SRC_DIR}" modules >"${log}" 2>&1; then
-        ok "编译成功  ($(stat -c%s "${KERNEL_SRC_DIR}/gen2kr.ko" 2>/dev/null || echo ?) 字节)"
+        ok "build succeeded  ($(stat -c%s "${KERNEL_SRC_DIR}/gen2kr.ko" 2>/dev/null || echo ?) bytes)"
         rm -f "${log}"
         return 0
     fi
 
-    err "编译失败，最后 20 行："
+    err "build failed; the last 20 lines:"
     tail -20 "${log}" | sed 's/^/     /'
     rm -f "${log}"
     echo
-    echo "   常见原因："
-    echo "     1. 内核头版本不匹配 —— 必须在跑这张卡的那台机器上编"
-    echo "     2. 编译器与内核构建时不一致（clang 内核 + gcc 编模块会报"
-    echo "        unrecognized command-line option '-mstack-alignment'）"
-    echo "     3. 目录属主不对 —— 编译用户必须能写该目录"
+    echo "   common causes:"
+    echo "     1. kernel headers version mismatch — must build on the machine actually running this card"
+    echo "     2. the compiler differs from the one the kernel was built with (clang kernel + gcc module builds report"
+    echo "        unrecognized command-line option '-mstack-alignment')"
+    echo "     3. wrong directory ownership — the build user must be able to write the directory"
     echo "        sudo chown -R ${cuser}:${cuser} ${VER_DIR}"
     return 1
 }
 
-# 模块 .ko 路径
+# The module .ko path
 kmod_path() { echo "${KERNEL_SRC_DIR}/gen2kr.ko"; }
 
-# 模块是否已编好
+# Whether the module is built
 kmod_built() { [ -f "$(kmod_path)" ]; }

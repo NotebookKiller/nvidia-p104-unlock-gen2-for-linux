@@ -1,48 +1,52 @@
 #!/bin/bash
 # ============================================================
-# build.sh —— 编译用户态探针与内核模块
+# build.sh — compile the user-space probes and the kernel module
 #
-# 两类产物的编译要求不同：
-#   · 用户态探针（minictx / bwtest2）：任何机器都能编，只依赖 gcc + libcuda
-#   · 内核模块（gen2kr.ko）：**必须用目标机器的内核头**
-#     （/lib/modules/$(uname -r)/build）
-#     ⇒ 要在跑 P104 的那台机器上编，不能拿别的机器的内核头凑
+# The two kinds of artifacts have different build requirements:
+#   · User-space probes (minictx / bwtest2): any machine can build them,
+#     they only need gcc + libcuda
+#   · Kernel module (gen2kr.ko): **must use the target machine's kernel headers**
+#     (/lib/modules/$(uname -r)/build)
+#     => build it on the machine that runs the P104s; do not borrow kernel
+#        headers from some other machine
 #
-# ★ 不要用 sudo 跑。root 编出来的产物归 root，之后普通用户改不动；
-#   若仓库在 NFS 上（root_squash），root 甚至写不进去
-#   （.gen2kr.o.d: 权限不够）。
+# ★ Do not run this with sudo. Artifacts built by root end up owned by root,
+#   and afterwards a normal user cannot modify them; if the repo sits on NFS
+#   (root_squash), root cannot even write there
+#   (.gen2kr.o.d: permission denied).
 #
-# 用法：
-#   bash bin/build.sh              # 全编
-#   bash bin/build.sh --user-only  # 只编用户态探针（任意机器）
+# Usage:
+#   bash bin/build.sh              # build everything
+#   bash bin/build.sh --user-only  # user-space probes only (any machine)
 # ============================================================
 set -u
 
 # ============================================================
-# 1. 变量
+# 1. Variables
 # ============================================================
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 KERNEL_BUILD_DIR="/lib/modules/${KVER}/build"
 
-DO_USER_ONLY=0          # 1 = 只编用户态探针
-COMPILE_USER=""         # 用哪个用户编译内核模块（root 时降权）
+DO_USER_ONLY=0          # 1 = build the user-space probes only
+COMPILE_USER=""         # which user compiles the kernel module (downgraded from root)
 
-# 用户态探针：产物名:说明（源文件固定为 src/<名>.c）
+# User-space probes: artifact name:description (the source file is always src/<name>.c)
 USER_PROBES=(
-    "minictx:零 DMA，只建/销毁 CUDA 上下文"
-    "bwtest2:带宽测试 H2D / D2H"
+    "minictx:zero DMA, only creates/destroys CUDA contexts"
+    "bwtest2:bandwidth test H2D / D2H"
 )
 
 # ============================================================
-# 2. 函数
+# 2. Functions
 # ============================================================
 
-# 决定用哪个用户编译和写产物
+# Decide which user compiles and owns the artifacts
 #
-# ★ 2026-10-29 踩的坑：NFS root_squash 下 root 被映射成 nobody，
-#   既写不进 kmod 的 .gen2kr.o.d，也覆盖不了 build/ 里 union 拥有的文件。
-#   有 SUDO_USER 就降权；没有就只能让用户自己用普通用户跑。
+# ★ Pitfall hit on 2026-10-29: under NFS root_squash, root is mapped to
+#   nobody -- it cannot write the kmod's .gen2kr.o.d and cannot overwrite
+#   the files in build/ owned by the union. When SUDO_USER exists, downgrade;
+#   when it does not, the user must run this as a normal user.
 determine_compile_user() {
     if [ "$(id -u)" != "0" ]; then
         COMPILE_USER="$(id -un)"
@@ -55,7 +59,7 @@ determine_compile_user() {
     return 1
 }
 
-# 以指定用户执行命令（root 时降权；本来就不是 root 就直跑）
+# Run a command as the given user (downgraded when root; just run when not root)
 run_as() {
     local user="$1"; shift
     if [ "${user}" = "$(id -un)" ]; then
@@ -65,7 +69,7 @@ run_as() {
     fi
 }
 
-# 打印分节标题
+# Print a section heading
 section() {
     echo
     echo "=============================================="
@@ -73,75 +77,76 @@ section() {
     echo "=============================================="
 }
 
-# 编译所有用户态探针。任一失败则返回 1。
+# Build every user-space probe. Returns 1 if any build fails.
 build_user_probes() {
     local item name desc
-    section "1. 用户态探针"
+    section "1. User-space probes"
 
     for item in "${USER_PROBES[@]}"; do
         name="${item%%:*}"
         desc="${item#*:}"
 
         if run_as "${COMPILE_USER}" gcc -O2 -o "build/${name}" "src/${name}.c" -ldl 2>/dev/null; then
-            echo "  ${name}  ✓   （${desc}）"
+            echo "  ${name}  ✓   (${desc})"
         else
-            echo "  ✗ ${name} 编译失败"
-            echo "    源文件: src/${name}.c"
-            echo "    若缺 libcuda.so.1：ls -l /usr/lib/x86_64-linux-gnu/libcuda.so.1"
+            echo "  ✗ ${name} failed to compile"
+            echo "    source file: src/${name}.c"
+            echo "    if libcuda.so.1 is missing: ls -l /usr/lib/x86_64-linux-gnu/libcuda.so.1"
             return 1
         fi
     done
     return 0
 }
 
-# 编译内核模块 gen2kr.ko。失败时给出常见原因。
+# Build the kernel module gen2kr.ko. On failure, list the usual causes.
 build_kernel_module() {
     local build_log
 
-    section "2. 内核模块 gen2kr.ko"
-    echo "  本机内核: ${KVER}"
+    section "2. Kernel module gen2kr.ko"
+    echo "  this machine's kernel: ${KVER}"
 
     if [ "${COMPILE_USER}" != "$(id -un)" ]; then
-        echo "  编译身份: ${COMPILE_USER}（root 编写不进产物，已降权）"
+        echo "  compiling as: ${COMPILE_USER} (root cannot write the artifacts; downgraded)"
     fi
 
-    # 前置条件二：必须有对应内核头
+    # Precondition 2: the matching kernel headers must exist
     if [ ! -d "${KERNEL_BUILD_DIR}" ]; then
-        echo "  ✗ 缺少内核头：${KERNEL_BUILD_DIR}"
-        echo "    安装：sudo apt install linux-headers-${KVER}"
+        echo "  ✗ kernel headers missing: ${KERNEL_BUILD_DIR}"
+        echo "    install: sudo apt install linux-headers-${KVER}"
         return 1
     fi
 
     if [ -z "${KMOD_DIR}" ]; then
-        echo "  ✗ 找不到内核模块源码目录"
-        echo "    期望: drivers/<驱动版本>/kernel/<内核版本>/gen2kr.c"
+        echo "  ✗ cannot find the kernel module source directory"
+        echo "    expected: drivers/<driver version>/kernel/<kernel version>/gen2kr.c"
         return 1
     fi
-    echo "  源码目录: ${KMOD_DIR#${PKG_ROOT}/}"
+    echo "  source directory: ${KMOD_DIR#${PKG_ROOT}/}"
 
-    # ★ 目录名是"这套模块验证过的内核版本"，与当前内核不一致要提示
+    # ★ The directory name records "the kernel version this module set was
+    #   validated on"; warn when it differs from the current kernel
     local dir_kver
     dir_kver="$(basename "${KMOD_DIR}")"
     if [ "${dir_kver}" != "${KVER_SHORT}" ]; then
-        echo "  ⚠ 目录记录的内核版本是 ${dir_kver}，当前是 ${KVER_SHORT}"
-        echo "    源码用稳定 API 通常能编过，但产物未经该内核验证"
+        echo "  ⚠ the directory records kernel version ${dir_kver}, current is ${KVER_SHORT}"
+        echo "    stable APIs usually let it compile, but the artifact is not validated on this kernel"
     fi
 
     cd "${KMOD_DIR}" || return 1
 
-    # ★ 必须清掉旧产物，否则 make 会说"无事可做"
+    # ★ Stale artifacts must be removed, otherwise make says "nothing to do"
     rm -f gen2kr.o gen2kr.ko .gen2kr.o.d \
           gen2kr.mod gen2kr.mod.c gen2kr.mod.o .gen2kr.mod.o.d \
           .module-common.o Module.symvers modules.order 2>/dev/null || true
 
-    # 目录属主要让编译用户可写
+    # Make the directory owned by (and writable to) the compiling user
     [ "${COMPILE_USER}" != "$(id -un)" ] && chown "${COMPILE_USER}" "${KMOD_DIR}" 2>/dev/null || true
 
     build_log="$(mktemp)"
     if run_as "${COMPILE_USER}" make -C "${KERNEL_BUILD_DIR}" M="${KMOD_DIR}" modules >"${build_log}" 2>&1; then
-        echo "  编译成功"
+        echo "  compile succeeded"
     else
-        echo "  ✗ 编译失败，最后 20 行："
+        echo "  ✗ compile failed, last 20 lines:"
         tail -20 "${build_log}" | sed 's/^/     /'
         rm -f "${build_log}"
         cd "${PKG_ROOT}" || true
@@ -151,47 +156,47 @@ build_kernel_module() {
     rm -f "${build_log}"
     cd "${PKG_ROOT}" || return 1
 
-    # 确认产物真的生成了
+    # Confirm the artifact was really produced
     if [ ! -f "${KMOD_DIR}/gen2kr.ko" ]; then
-        echo "  ✗ 编译\"成功\"但没有产物，检查 ${KMOD_DIR}/Makefile"
+        echo "  ✗ compile \"succeeded\" but no artifact exists; check ${KMOD_DIR}/Makefile"
         return 1
     fi
 
-    # 拷贝也降权，避免 build/ 里出现 root 拥有的产物
+    # The copy is also downgraded, so build/ does not end up with root-owned artifacts
     mkdir -p build
     [ "${COMPILE_USER}" != "$(id -un)" ] && chown "${COMPILE_USER}" build 2>/dev/null || true
     run_as "${COMPILE_USER}" cp -f "${KMOD_DIR}/gen2kr.ko" build/
-    echo "  gen2kr.ko ✓  ($(stat -c%s "${KMOD_DIR}/gen2kr.ko") 字节)"
+    echo "  gen2kr.ko ✓  ($(stat -c%s "${KMOD_DIR}/gen2kr.ko") bytes)"
     return 0
 }
 
-# 内核模块编译失败时的排查提示
+# Troubleshooting hints for a kernel module build failure
 print_kmod_failure_hints() {
     echo
-    echo "  常见原因："
-    echo "    1. 内核头版本不匹配 —— 必须在跑 P104 的那台机器上编译"
-    echo "       （当前 ${KVER}，若目标机器内核不同，请在目标机器上运行）"
-    echo "    2. 编译器与内核构建时不一致（clang 构建的内核 + gcc 编模块会报"
-    echo "       unrecognized command-line option '-mstack-alignment'）"
-    echo "    3. NFS root_squash —— 不要用 sudo"
+    echo "  common causes:"
+    echo "    1. kernel header version mismatch -- you must build on the machine that runs the P104s"
+    echo "       (current ${KVER}; if the target machine's kernel differs, run there)"
+    echo "    2. compiler mismatch with the kernel build (a clang-built kernel + gcc-built"
+    echo "       module reports unrecognized command-line option '-mstack-alignment')"
+    echo "    3. NFS root_squash -- do not use sudo"
 }
 
-# 列出产物并提示下一步
+# List the artifacts and hint at the next step
 show_products() {
-    section "产物"
+    section "Artifacts"
     ls -la build/
     echo
-    echo "下一步：sudo bash bin/10-check.sh    （自检，纯只读）"
+    echo "next step: sudo bash bin/10-check.sh    (self-check, strictly read-only)"
 }
 
-# 解析命令行参数
+# Parse command-line arguments
 parse_args() {
     case "${1:-}" in
         --user-only) DO_USER_ONLY=1 ;;
         "")          ;;
         *)
-            echo "未知参数: $1" >&2
-            echo "用法: bash bin/build.sh [--user-only]" >&2
+            echo "unknown argument: $1" >&2
+            echo "usage: bash bin/build.sh [--user-only]" >&2
             exit 2
             ;;
     esac
@@ -206,13 +211,13 @@ main() {
     cd "${PKG_ROOT}" || exit 1
 
     if ! determine_compile_user; then
-        echo "✗ 当前是 root 且拿不到 SUDO_USER，无法确定编译身份" >&2
-        echo "  请用普通用户跑：bash bin/build.sh" >&2
+        echo "✗ running as root without SUDO_USER; cannot determine the compiling identity" >&2
+        echo "  run as a normal user: bash bin/build.sh" >&2
         exit 1
     fi
 
     mkdir -p build
-    # build/ 若之前被 root 建过，转给编译用户，否则它写不进去
+    # If build/ was created by root earlier, hand it to the compiling user, otherwise it cannot write
     if [ "${COMPILE_USER}" != "$(id -un)" ]; then
         chown "${COMPILE_USER}" build 2>/dev/null || true
     fi
@@ -221,7 +226,7 @@ main() {
 
     if [ "${DO_USER_ONLY}" = "1" ]; then
         echo
-        echo "已跳过内核模块（--user-only）"
+        echo "skipped the kernel module (--user-only)"
         exit 0
     fi
 

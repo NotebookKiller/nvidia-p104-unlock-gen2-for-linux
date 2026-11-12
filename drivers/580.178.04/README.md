@@ -1,187 +1,207 @@
 # 580.178.04
 
-NVIDIA 580.178.04 / kernel 6.12.113+deb13-amd64 / Debian 13 / P104-100。
-**这是唯一完整验证过的版本组合。**
+NVIDIA 580.178.04 / kernel 6.12.113+deb13-amd64 / Debian 13 / P104-100.
+**This is the only fully verified version combination.**
 
 ---
 
-## 脚本（按编号顺序执行）
+## Scripts (run in numbered order)
 
 ```
-00-whitelist.sh    前置，可选    解除「受限 SKU」判定（解决帧率/功耗，与 Gen2 无关）
-01-gen2-patch.sh   必做          修补 nvidia.ko，让驱动不再把速率降回 Gen1
-02-gen2-push.sh    必做          加载模块并把链路推到 Gen2（start/stop/status）
+00-whitelist.sh    pre-step, optional    lifts the "restricted SKU" check (fixes framerate/power; unrelated to Gen2)
+01-gen2-patch.sh   required              patches nvidia.ko so the driver stops dropping the speed back to Gen1
+02-gen2-push.sh    required              loads the module and pushes the link to Gen2 (start/stop/status)
 ```
 
-每个脚本都有三种动作：`check`（只读）/ `apply` 或 `start` / `revert` 或 `stop`。
+Every script supports three actions: `check` (read-only) / `apply` or `start` /
+`revert` or `stop`.
 
 ---
 
-## 一、怎么用
+## 1. How to use
 
-> ### ⚠⚠ 头号坑：DKMS 会把你的补丁覆盖掉
+> ### ⚠⚠ Pitfall number one: DKMS will overwrite your patch
 >
-> 打补丁编出来的 `nvidia.ko` 有两个去处，**它们是独立文件，不是软链**：
+> The `nvidia.ko` produced by patching has two homes, and **they are separate
+> files, not symlinks**:
 >
-> | 位置 | 作用 |
+> | location | role |
 > |---|---|
-> | `/usr/src/nvidia-580.178.04/nvidia.ko` | `make` 的产物 |
-> | `/var/lib/dkms/nvidia/580.178.04/<kver>/x86_64/module/nvidia.ko` | **DKMS 的「built」缓存** |
-> | `/lib/modules/<kver>/updates/dkms/nvidia.ko` | **启动时 modprobe 真正读的** |
+> | `/usr/src/nvidia-580.178.04/nvidia.ko` | the `make` artifact |
+> | `/var/lib/dkms/nvidia/580.178.04/<kver>/x86_64/module/nvidia.ko` | **DKMS's "built" cache** |
+> | `/lib/modules/<kver>/updates/dkms/nvidia.ko` | **what modprobe actually reads at boot** |
 >
-> `dkms install`（以及装新内核时的 `autoinstall`）会拿 **built 缓存**去覆盖
-> `/lib/modules` 那份。缓存里要是老版本，**你的补丁全丢，重启后照旧 19fps**。
+> `dkms install` (and `autoinstall` when a new kernel is installed) takes the
+> **built cache** and overwrites the `/lib/modules` copy. If the cache holds an
+> old version, **your patch is gone entirely and you are back to 19fps after
+> the reboot**.
 >
-> **所以打完补丁必须同步**：
+> **So after patching you must sync**:
 >
 > ```bash
-> sudo ./sync-dkms.sh status   # 看三处是否一致
-> sudo ./sync-dkms.sh adopt    # 把当前生效的那份固化到 DKMS 缓存 + /usr/src
+> sudo ./sync-dkms.sh status   # check whether the three places agree
+> sudo ./sync-dkms.sh adopt    # pin the currently-live copy into the DKMS cache + /usr/src
 > ```
 >
-> 2026-10-30 实测踩过：打完 00、按提示 `make` 了，重启后仍是 19fps ——
-> 因为只 `make` 了 `/usr/src`，DKMS 缓存还是 10-28 的原始版
-> （md5 `7f6805ed…`，P104-100 出现 2 次）。跑 `adopt` 后三处 md5 一致，重启不再丢。
+> Hit for real on 2026-10-30: patched 00, ran the prompted `make`, rebooted,
+> still 19fps — because only `/usr/src` got `make`'d while the DKMS cache was
+> still the 10-28 original (md5 `7f6805ed…`, appearing 2 times on the
+> P104-100). After running `adopt`, all three places had the same md5 and
+> reboots stopped losing it.
 
-### 第 0 步（可选）：解除受限 SKU
+### Step 0 (optional): lift the restricted SKU
 
-**不做也不影响 Gen2**，只影响帧率/功耗。只想提升带宽的话跳过这步。
+**Skipping this does not affect Gen2**; it only affects framerate/power. Skip
+it if all you want is bandwidth.
 
 ```bash
-sudo bash 00-whitelist.sh check     # 看当前状态（会列出表里有哪些卡）
-sudo bash 00-whitelist.sh apply     # 打补丁
+sudo bash 00-whitelist.sh check     # current state (lists the cards in the table)
+sudo bash 00-whitelist.sh apply     # apply the patch
 ```
 
-打完后必须**重建内核模块**（脚本会打印完整命令）：
+Afterwards you must **rebuild the kernel module** (the script prints the full
+command):
 
 ```bash
 cd /usr/src/nvidia-580.178.04
-sudo make -j$(nproc)                # ★ 必须用 root；否则报权限错，容易被误判成编译器问题
+sudo make -j$(nproc)                # ★ must run as root; otherwise you get a permission error that is easy to mistake for a compiler problem
 ```
 
-然后同步 DKMS 并重载驱动或重启：
+Then sync DKMS and reload the driver or reboot:
 
 ```bash
-sudo ./sync-dkms.sh adopt           # ★ 不做这步，重启就白打
+sudo ./sync-dkms.sh adopt           # ★ skip this and the reboot undoes everything
 ```
 
-> ★ **重编会让 01 的 gen2 补丁消失**（01 是直接改 `.ko`，重编就没了）。
-> 正确顺序：**00 白名单 → make → sync-dkms adopt → 01 gen2 → sync-dkms adopt**。
+> ★ **Rebuilding makes the 01 gen2 patch vanish** (01 modifies the `.ko`
+> directly; a rebuild discards it).
+> Correct order: **00 whitelist -> make -> sync-dkms adopt -> 01 gen2 ->
+> sync-dkms adopt**.
 
-### 第 1 步：修补 nvidia.ko
+### Step 1: patch nvidia.ko
 
 ```bash
-sudo bash 01-gen2-patch.sh check    # 看当前状态
-sudo bash 01-gen2-patch.sh apply    # 打 2 字节补丁
+sudo bash 01-gen2-patch.sh check    # current state
+sudo bash 01-gen2-patch.sh apply    # apply the 2-byte patch
 ```
 
-> **关于 md5 警告**：如果先跑过 00（白名单），这一步必定报
-> `⚠ md5 写前与记录不一致`。**这是预期行为，不影响执行** ——
-> md5 只是提示，真正的安全网是「32 字节签名唯一定位 + 三态校验」。
-> 详见 `docs/故障排查.md` 的「md5 不一致」。
+> **About the md5 warning**: if you ran 00 (whitelist) first, this step will
+> always report `⚠ md5 mismatch from the pre-write record`. **That is expected
+> behavior and does not stop execution** — md5 is only an advisory; the real
+> safety net is "unique 32-byte signature location + three-state check".
+> See `docs/troubleshooting.md` under "md5 mismatch".
 
-打完必须让新代码生效，二选一：
+Once applied the new code must be loaded, either way:
 
 ```bash
-# A) 重载模块（快，会中断图形会话）
+# A) reload the modules (fast; interrupts the graphical session)
 sudo rmmod nvidia_drm nvidia_modeset nvidia_uvm nvidia
 sudo modprobe nvidia && sudo modprobe nvidia_uvm nvidia_modeset nvidia_drm
 
-# B) 直接重启 —— 但前提是先 sync-dkms adopt，否则缓存会把它盖回去
+# B) just reboot — but only after sync-dkms adopt, or the cache will roll it back
 ```
 
-> ⚠ **重载/重启前先确认没有程序占用 GPU**：
+> ⚠ **Before reloading/rebooting, confirm nothing is using the GPU**:
 > ```bash
 > fuser -v /dev/nvidia*
 > ```
-> 有输出就先关掉（浏览器 / Electron 应用最常见）。
-> 否则 `unbind` 会卡死内核，进程落入 D 状态、`kill -9` 无效，只能整机重启。
+> If it prints anything, close those programs first (browsers / Electron apps
+> are the usual culprits). Otherwise `unbind` wedges the kernel: processes end
+> up in D state and `kill -9` does nothing; only a full reboot works.
 
-> **Debian/Ubuntu 的模块是 `.ko.zst` 压缩的**
+> **Debian/Ubuntu ship the module compressed as `.ko.zst`**
 >
-> 发行版（含 Ubuntu 24.04）常用 zstd 压缩内核模块，文件是 `nvidia.ko.zst`。
-> 补丁脚本**已经自动处理**：检测到 zstd 魔数就解压到内存里找签名，写完再按原级别
-> （默认 `-19`，可用 `ZSTD_LEVEL` 覆盖）重新压缩、原子替换。
-> 需要系统里有 `zstd` 命令（`apt install zstd`）。
+> Distributions (including Ubuntu 24.04) commonly use zstd-compressed kernel
+> modules; the file is `nvidia.ko.zst`. The patch scripts **handle this
+> automatically**: when the zstd magic is detected they decompress into memory
+> to find the signature, then re-compress at the original level (default
+> `-19`, override with `ZSTD_LEVEL`) and atomically replace the file.
+> The system needs the `zstd` command (`apt install zstd`).
 >
-> 手工核对补丁是否真的进了压缩包：
+> To manually confirm the patch really made it into the compressed blob:
 > ```bash
-> zstd -dc "$(modinfo -n nvidia)" | md5sum     # 与脚本打印的「解压后 md5」对照
+> zstd -dc "$(modinfo -n nvidia)" | md5sum     # compare against the "uncompressed md5" the script prints
 > ```
 
-### 第 2 步：把链路推上去
+### Step 2: push the link up
 
-补丁只做到"驱动不再降级"，**链路本身还要有人推**。
+The patch only achieves "the driver stops downgrading"; **the link still needs
+someone to push it**.
 
 ```bash
-sudo bash 02-gen2-push.sh status    # 先看状态
-sudo bash 02-gen2-push.sh start     # 编译（若无）+ 加载模块 + 推送
+sudo bash 02-gen2-push.sh status    # check state first
+sudo bash 02-gen2-push.sh start     # build (if needed) + load the module + push
 ```
 
-`start` 会依次做：检查补丁 → 准备模块 → **确认 GPU 空闲** → insmod → unbind/bind → 等 Gen2。
+`start` does, in order: check the patch -> prepare the module -> **confirm the
+GPU is idle** -> insmod -> unbind/bind -> wait for Gen2.
 
-> `start` 需要 root（要 insmod / 写 sysfs），但**编译模块不能用 root**
-> （NFS 上 root_squash 会让 root 写不进 `.gen2kr.o.d`）。
-> 脚本会自动降权到 `SUDO_USER` 编译，所以直接 `sudo ./02-gen2-push.sh start` 就行。
-> 只想编译的话不用 sudo：`./02-gen2-push.sh build`。
+> `start` needs root (for insmod / writing sysfs), but **the module must not be
+> compiled as root** (on NFS, root_squash prevents root from writing
+> `.gen2kr.o.d`). The script automatically drops privileges to `SUDO_USER` for
+> the build, so plain `sudo ./02-gen2-push.sh start` is fine.
+> To only build, no sudo is needed: `./02-gen2-push.sh build`.
 
-### 第 3 步：验证
+### Step 3: verify
 
 ```bash
 sudo bash 02-gen2-push.sh status           # CAP2=0x0006 LNKSTA=2
-sudo bash ../../bin/30-verify.sh           # 带宽 + 稳定性
+sudo bash ../../bin/30-verify.sh           # bandwidth + stability
 ```
 
-- 成功：`LNKSTA=2`（5GT/s），pinned H2D ≈ 1.56 GB/s
-- 失败：看 `dmesg | grep gen2kr`
+- success: `LNKSTA=2` (5GT/s), pinned H2D ≈ 1.56 GB/s
+- failure: look at `dmesg | grep gen2kr`
 
 ---
 
-## 二、还原（反向依次来）
+## 2. Reverting (reverse order)
 
 ```bash
-sudo bash 02-gen2-push.sh stop      # 先卸模块
-sudo bash 01-gen2-patch.sh revert   # 再还原 nvidia.ko
-sudo bash 00-whitelist.sh revert    # 最后还原设备表（如果第 0 步做过）
+sudo bash 02-gen2-push.sh stop      # unload the module first
+sudo bash 01-gen2-patch.sh revert   # then restore nvidia.ko
+sudo bash 00-whitelist.sh revert    # finally restore the device table (if step 0 was done)
 ```
 
-每一步之后都要重载驱动或重启（`stop` 除外）。顺序不能反 ——
-先 `revert` 补丁而模块还在，守卫会继续把 SPEED 写回去。
+After each step, reload the driver or reboot (except for `stop`). The order
+must not be reversed — reverting the patch while the module is still loaded
+leaves the guard writing SPEED back.
 
 ---
 
-## 三、02 的完整动作
+## 3. Everything 02 does
 
-| 动作 | 说明 |
+| action | description |
 |---|---|
-| `status` | 模块是否加载、模块参数、链路状态（只读） |
-| `start` | 编译（若无）+ 加载 + 推送 + 等 Gen2 |
-| `stop` | 卸载模块（守卫停止，链路会在下次 `cuInit` 降回 Gen1） |
+| `status` | whether the module is loaded, module parameters, link state (read-only) |
+| `start` | build (if needed) + load + push + wait for Gen2 |
+| `stop` | unload the module (guard stops; the link drops back to Gen1 on the next `cuInit`) |
 | `restart` | `stop` + `start` |
-| `build` | 只编译模块 |
-| `uninstall` | `stop` + 删除编译产物（源码保留） |
+| `build` | only build the module |
+| `uninstall` | `stop` + delete build artifacts (sources kept) |
 
 ---
 
-## 四、空闲压功耗：关掉自动登录就行
+## 4. Idle power savings: just turn off autologin
 
-**这张卡不干活的时候也一直停在 P0、SM 顶 1607 MHz、白烧 22 W。**
-但只要有一个 **Xorg** 占着它，15 秒内就进 P8，降到 ~7.8 W。
+**When this card has nothing to do it stays in P0, the SM at 1607 MHz,
+burning 22 W for free.** But as soon as one **Xorg** holds it, within 15
+seconds it drops to P8 and ~7.8 W.
 
-**不需要装任何东西。** SDDM 默认的 X11 greeter 就是那个 Xorg：
-它由 sddm 自己拉起、`-noreset` 常驻，**登录进桌面之后也还在**。
+**Nothing needs to be installed.** SDDM's default X11 greeter is that Xorg:
+sddm launches it itself, it stays resident with `-noreset`, and **it survives
+even after you log into the desktop**.
 
-| 状态 | P-state | SM | 功耗 |
+| state | P-state | SM | power |
 |---|---|---|---|
-| 无 Xorg | P0 | 1607 MHz | 22.3 ~ 22.6 W |
-| 有 Xorg（sddm 的 `:0`） | **P8** | 139 MHz | **7.4 ~ 8.0 W** |
-| Xorg 退出 | P0 | 1607 MHz | 22.4 W |
+| no Xorg | P0 | 1607 MHz | 22.3 ~ 22.6 W |
+| with Xorg (sddm's `:0`) | **P8** | 139 MHz | **7.4 ~ 8.0 W** |
+| Xorg exits | P0 | 1607 MHz | 22.4 W |
 
-省约 **14.6 W（-65%）**，可逆。
+Saves about **14.6 W (-65%)**, reversible.
 
-### 唯一要做的事：关掉 SDDM 自动登录
+### The only thing to do: disable SDDM autologin
 
-`/etc/sddm.conf.d/*.conf` 里把 `[Autologin]` 清空：
+In `/etc/sddm.conf.d/*.conf`, empty out `[Autologin]`:
 
 ```ini
 [Autologin]
@@ -190,34 +210,34 @@ Session=
 User=
 ```
 
-然后重启（或 `systemctl restart sddm`）。开机后 sddm 会走完整的
-「起 display server → 起 greeter」流程，那个 Xorg 就一直在了。
+Then reboot (or `systemctl restart sddm`). At boot, sddm goes through the full
+"launch display server -> launch greeter" flow, and that Xorg stays around.
 
-### 为什么自动登录时没有 Xorg
+### Why there is no Xorg under autologin
 
-自动登录会把这两步整个跳过 —— 实测日志对比（同一台机）：
+Autologin skips both steps entirely — measured log comparison (same machine):
 
 ```
-# 自动登录（Session=plasma, User=union）
+# autologin (Session=plasma, User=union)
 sddm-helper: pam_unix(sddm-autologin:session): session opened for user union
 sddm:        Session ".../plasma.desktop" selected ... --autologin
-grep -c "Display server starting"  →  0      ← 压根没起 Xorg
+grep -c "Display server starting"  ->  0      <- no Xorg started at all
 
-# 关掉自动登录之后
+# with autologin disabled
 sddm: Display server starting...
 sddm: Display server started.
 sddm: Greeter starting...
-sddm-helper: Starting X11 session: "" "/usr/bin/sddm-greeter-qt6 ..."   ← X11
-grep -c "Display server starting"  →  1
+sddm-helper: Starting X11 session: "" "/usr/bin/sddm-greeter-qt6 ..."   <- X11
+grep -c "Display server starting"  ->  1
 ```
 
-登录进 Wayland 桌面后 greeter 会退出，但 sddm 那个 **Xorg 进程不退出**
-（`ps` 里能看到它的父进程就是 `/usr/bin/sddm`，参数带 `-noreset`），
-所以卡一直保持 P8。
+After logging into the Wayland desktop the greeter exits, but sddm's **Xorg
+process does not exit** (`ps` shows its parent as `/usr/bin/sddm`, with
+`-noreset` in the args), so the card keeps sitting in P8.
 
-### ⚠ 它和 Gen2 推送是冲突的
+### ⚠ It conflicts with the Gen2 push
 
-这个 Xorg 会**一直占着 `/dev/nvidia*`**：
+This Xorg **holds `/dev/nvidia*` the whole time**:
 
 ```
 /dev/nvidia0:        root  1095 F...m Xorg
@@ -225,242 +245,272 @@ grep -c "Display server starting"  →  1
 /dev/nvidia-modeset: root  1095 F.... Xorg
 ```
 
-而 `02-gen2-push.sh` 的 `start` 靠 `unbind`/`bind` 触发 probe ——
-**GPU 被占用时 `unbind` 会挂在 `device_release_driver_internal` 里**，
-进程进 D 状态、`kill -9` 也没用，只能重启（踩过一次，见 `docs/安全纪律.md` 铁律 9b）。
-所以脚本里的 `check_gpu_idle()` 会直接拦住，这是对的。
+And `02-gen2-push.sh start` relies on `unbind`/`bind` to trigger probe —
+**when the GPU is in use, `unbind` hangs inside
+`device_release_driver_internal`**, processes go into D state and `kill -9`
+does nothing; only a reboot helps (happened once; see iron rule 9b in
+`docs/safety-discipline.md`). So the script's `check_gpu_idle()` blocks it
+outright, and that is correct.
 
-两条路只能选一条，或者按顺序做：
+You can only pick one path, or sequence them:
 
-| 想要 | 做法 |
+| goal | how |
 |---|---|
-| **省电**（P8，7.5 W） | 关自动登录，让 sddm 的 Xorg 常驻。链路停在 Gen1 |
-| **Gen2**（1.56 GB/s） | 先 `systemctl stop sddm` 把 Xorg 停掉 → 推 Gen2 → 再 `start sddm` |
+| **power saving** (P8, 7.5 W) | turn off autologin so sddm's Xorg stays resident. Link sits at Gen1 |
+| **Gen2** (1.56 GB/s) | first `systemctl stop sddm` to stop Xorg -> push Gen2 -> then `start sddm` |
 
-顺序很重要：**先推 Gen2、后起 Xorg** 是可以两全的 —— 补丁在位时 `cuInit`
-不会再降级，Xorg 起来之后链路仍保持 Gen2。反过来（Xorg 先占着）就推不动了。
-
----
-
-### ⚠ `Xwayland` 不算
-
-Wayland 会话里的 `Xwayland` 替代不了 Xorg —— 实测有 Xwayland 时卡**仍然**停在
-P0 烧 22 W。判据很简单：
-
-```bash
-pgrep -x Xorg        # 有输出 = 有真 Xorg；只看到 Xwayland 不算
-```
-
-没有 sddm 的机器（纯 console / 别的 DM）才需要自己起一个：
-
-```bash
-Xorg :8 -config /etc/bumblebee/xorg.conf.nvidia   # 装了 bumblebee 的话
-```
-
-（本仓库早先带过一套 `xorg/xorg-p104.sh` 做这件事，后来发现上面这条
-「关掉自动登录」就够、且更干净，已删除 —— `git show 5972b68` 可查。）
-
-> 顺带一句：想让**程序**用 P104 渲染是另一件事 —— PRIME offload，
-> `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia <程序>`，
-> 和压功耗无关。
+Ordering matters: **push Gen2 first, start Xorg afterwards** gives you both —
+with the patch in place `cuInit` no longer downgrades, and the link keeps Gen2
+after Xorg starts. The reverse (Xorg holds it first) cannot be pushed.
 
 ---
 
-## 五、提速：帧率与功耗
+### ⚠ `Xwayland` does not count
 
-P1XX / CMP 矿卡除了 PCIe 受限，还有**另一个独立问题**：帧率卡在 ~40fps、功耗上不去。
-那是驱动每批次往 pushbuffer 写 `method 0x3998 = 0xF0(240)`（≈218µs 空转/批）造成的。
+`Xwayland` inside a Wayland session is no substitute for Xorg — measured: with
+Xwayland present the card **still** sat in P0 burning 22 W. The criterion is
+simple:
 
-**本目录不提供那个补丁**（改的是 `libnvidia-glcore.so`，属用户态 GL 库，另一个课题）。
-需要的话去这两处：
+```bash
+pgrep -x Xorg        # output = a real Xorg; only seeing Xwayland does not count
+```
 
-- **clear-delay 项目**（用户态方案）：<https://github.com/WJNKAC/nvidia-p106-clear-delay>
-- **上游分析**（内核白名单思路，`00-whitelist.sh` 的出处）：
+Only machines without sddm (pure console / another DM) need to start one:
+
+```bash
+Xorg :8 -config /etc/bumblebee/xorg.conf.nvidia   # if bumblebee is installed
+```
+
+(An earlier revision of this repo shipped `xorg/xorg-p104.sh` for this; it was
+removed after discovering that the "disable autologin" trick above is enough
+and cleaner — see `git show 5972b68`.)
+
+> By the way: making **programs** render on the P104 is a separate matter —
+> PRIME offload,
+> `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia <program>`,
+> unrelated to power savings.
+
+---
+
+## 5. Speedup: framerate and power
+
+Besides the PCIe restriction, P1XX / CMP mining cards have **another
+independent problem**: framerate stuck at ~40fps and power that cannot climb.
+That is caused by the driver writing to the pushbuffer every batch with
+`method 0x3998 = 0xF0 (240)` (≈218µs of idle spin per batch).
+
+**This directory does not provide that patch** (it modifies
+`libnvidia-glcore.so`, a user-space GL library, a separate topic). If you need
+it, see:
+
+- **the clear-delay project** (user-space approach): <https://github.com/WJNKAC/nvidia-p106-clear-delay>
+- **upstream analysis** (the kernel-whitelist idea, the origin of `00-whitelist.sh`):
   <https://github.com/dartraiden/NVIDIA-patcher/issues/3>
 
-> ★ **但注意**：`00-whitelist.sh` 能**从源头上解决它** ——
-> 打了之后那条延迟命令**根本不生成**（不是"生成了但跳过"），
-> 帧时间 52.202 → 3.668 ms，fps 18.98 → 243.78。
-> 所以如果你两边都想要，直接做第 0 步就够，不需要那个用户态补丁。
+> ★ **But note**: `00-whitelist.sh` can **solve it at the root** —
+> after applying, the delay command is **never generated at all** (not
+> "generated but skipped"); frame time 52.202 -> 3.668 ms, fps 18.98 -> 243.78.
+> So if you want both fixes, doing step 0 is enough; the user-space patch is
+> not needed.
 
 ---
 
-## 六、目录里的文件
+## 6. Files in this directory
 
 ```
-00-whitelist.sh      前置（可选）：改 nv-kernel.o_binary
-01-gen2-patch.sh     必做：改 nvidia.ko
-02-gen2-push.sh      必做：加载模块 + 推送链路
-sync-dkms.sh         ★ 打完补丁同步到 DKMS，防重启被覆盖
-offsets.sh           本版本的偏移与原始字节（纯变量，可 source）
-kernel/6.12.113/     内核模块源码（按内核版本分目录）
-README.md            本文件
-utils/               ★ 公共脚本（多个脚本共用，集中放这里）
-  bdf.sh             目标 GPU 的 PCIe BDF 自动发现（单一来源）
-  _lib.sh            公共部分（路径、颜色、寄存器读取、GPU 占用检查、模块编译）
-  _patch.py          通用二进制补丁器（JSON 规格驱动，被 00/01 调用）
+00-whitelist.sh      pre-step (optional): modifies nv-kernel.o_binary
+01-gen2-patch.sh     required: modifies nvidia.ko
+02-gen2-push.sh      required: loads the module + pushes the link
+sync-dkms.sh         ★ syncs the patch into DKMS after patching, so a reboot cannot undo it
+offsets.sh           this version's offsets and original bytes (plain variables, sourceable)
+kernel/6.12.113/     kernel module sources (one directory per kernel version)
+README.md            this file
+utils/               ★ shared scripts (used by several scripts, kept here)
+  bdf.sh             automatic discovery of the target GPU's PCIe BDF (single source of truth)
+  _lib.sh            common parts (paths, colors, register reads, GPU-usage check, module build)
+  _patch.py          generic binary patcher (JSON-spec driven, called by 00/01)
 ```
 
-> `utils/` 里的东西**被上面几个脚本 source**，不要直接当成命令跑
-> （`bdf.sh` 例外，它可以单独执行，只打印发现的 BDF）。
-> 所有脚本都用 `$(dirname "${BASH_SOURCE[0]}")/utils/...` 定位，所以**整个仓库可以随便挪位置**。
+> Things in `utils/` are **sourced by the scripts above**; do not run them
+> directly as commands (`bdf.sh` is the exception — it runs standalone and
+> only prints the discovered BDF).
+> All scripts locate utils with `$(dirname "${BASH_SOURCE[0]}")/utils/...`, so
+> **the whole repo can be moved anywhere**.
 
-### 为什么模块按内核版本分目录
+### Why the module is nested by kernel version
 
-补丁偏移跟**驱动版本**绑定；模块编译产物跟**内核版本**绑定。两者是不同的东西：
+Patch offsets are bound to the **driver version**; the module build artifact is
+bound to the **kernel version**. They are two different things:
 
-| | 绑定什么 | 为什么 |
+| | bound to | why |
 |---|---|---|
-| `offsets.sh` / `_patch.py` | 驱动版本 | 改的是驱动二进制的字节偏移 |
-| `kernel/<内核版本>/` | 内核版本 | `.ko` 只能用目标机器的内核头编，换内核加载不了 |
+| `offsets.sh` / `_patch.py` | driver version | they modify byte offsets of the driver binary |
+| `kernel/<kernel-version>/` | kernel version | the `.ko` must be compiled against the target machine's kernel headers; a different kernel cannot load it |
 
-换内核版本时**新建同级目录**，不要原地改名 —— 老目录是历史验证记录。
+When the kernel version changes, **create a new sibling directory** instead of
+renaming in place — the old directory is the historical verification record.
 
 ---
 
-## 六之二、多卡机器：必须指定目标是哪张卡
+## 6a. Multi-card machines: you must name the target card
 
-脚本默认**按 device id 自动找卡**（`10de:1b87` = P104-100），不需要写死在哪个槽位。
-但如果你机器上有**多张**同型卡（比如两张 P104），自动发现会拒绝执行，必须显式指定：
+The scripts **find the card automatically by device id** (`10de:1b87` =
+P104-100); no need to hardcode a slot. But if your machine has **multiple**
+cards of the same type (say two P104s), automatic discovery refuses to run and
+you must specify explicitly:
 
 ```bash
-# 显式指定 BDF（槽位从 lspci -Dn | grep 10de 看）
+# explicit BDF (check the slots with lspci -Dn | grep 10de)
 TARGET_BDF=0000:02:00.0 sudo -E bash 02-gen2-push.sh start
 
-# 或者换一个 device id 去找（比如 P106-100 是 1c07）
+# or search for a different device id (the P106-100 is 1c07)
 TARGET_IDS=1c07 sudo -E bash 02-gen2-push.sh start
 
-# 只看发现结果，不动任何东西
+# discovery only; nothing is touched
 bash utils/bdf.sh
 ```
 
-可用环境变量：
+Available environment variables:
 
-| 变量 | 默认 | 作用 |
+| variable | default | role |
 |---|---|---|
-| `TARGET_IDS` | `1b87` | 目标 device id，空格分隔可给多个（`"1b87 1c07"`） |
-| `TARGET_BDF` | 空 | 显式指定 BDF，跳过自动发现 |
+| `TARGET_IDS` | `1b87` | target device id; space-separated list allowed (`"1b87 1c07"`) |
+| `TARGET_BDF` | empty | explicit BDF, skips auto-discovery |
 
-> ⚠ **为什么不能用固定的 `01:00.0`**
+> ⚠ **Why a hardcoded `01:00.0` will not work**
 >
-> 早期版本硬编码 `01:00.0`。多卡机上如果你的 P104 在 `02:00.0`，
-> 而 `01:00.0` 是另一张卡（例如已满速 Gen3 的 P100），脚本会**对着 P100 读写**：
-> 读出 `CAP2=0x0006 / TLS=2`，却始终 `LNKSTA=1041`（P100 本来就满速），
-> 看起来像"锁死"，实际是**设备选错了**。
-> 更糟的是 `10-check.sh` 的设备检查走另一条路径，会出现
-> 「第 2 节说 P104 在总线，第 3 节却显示 P100 的 `cfg=1f6f10de`」这种自相矛盾。
+> Early versions hardcoded `01:00.0`. On a multi-card machine where your P104
+> sits at `02:00.0` and `01:00.0` is a different card (e.g. a P100 already at
+> full speed Gen3), the script would **read and write the P100**: it would read
+> `CAP2=0x0006 / TLS=2` yet always see `LNKSTA=1041` (the P100 is at full speed
+> by design), looking like a "lock-up" when in fact **the wrong device was
+> chosen**. Worse, `10-check.sh` takes a different path for the device check,
+> producing contradictions like "section 2 says the P104 is on the bus, but
+> section 3 shows the P100's `cfg=1f6f10de`".
 >
-> 现在 BDF 只在 `utils/bdf.sh` 里算一次，所有脚本共用，不会再出现两处不一致。
+> Now the BDF is computed once in `utils/bdf.sh` and shared by all scripts, so
+> the two-path mismatch can no longer happen.
 
 ---
 
-## 七、原理（想深究再看）
+## 7. The mechanics (read if you want depth)
 
-### 01：nvidia.ko，2 字节
+### 01: nvidia.ko, 2 bytes
 
-`_nv017105rm`（驱动的 `set_link_speed(mode)`）入口的 mode 白名单
-从 `{1,2,3}` 收窄成 `{2,3}`，让 `mode==1` 走原有的 bail 分支。
+The mode whitelist at the entry of `_nv017105rm` (the driver's
+`set_link_speed(mode)`) is narrowed from `{1,2,3}` to `{2,3}`, so `mode==1`
+falls into the pre-existing bail branch.
 
 ```asm
-_ nv017105rm:
+_nv017105rm:
   8d 42 ff              lea    -0x1(%rdx),%eax     ; eax = mode - 1
   ...
   83 f8 02              cmp    $0x2,%eax
   0f 87 xx xx xx xx     ja     <bail>
 ```
 
-改成：
+becomes:
 
 ```asm
-  8d 42 fe              lea    -0x2(%rdx),%eax     ; eax = mode - 2   (ff → fe)
+  8d 42 fe              lea    -0x2(%rdx),%eax     ; eax = mode - 2   (ff -> fe)
   ...
-  83 f8 01              cmp    $0x1,%eax                               (02 → 01)
+  83 f8 01              cmp    $0x1,%eax                               (02 -> 01)
 ```
 
-`(mode-2) > 1` 按无符号比较：
+`(mode-2) > 1` under unsigned comparison:
 
-| mode | eax | 结果 |
+| mode | eax | result |
 |---|---|---|
-| 1 | `0xFFFFFFFF`（下溢） | bail ★ 唯一的行为变化 |
-| 2 | 0 | 继续（与原逻辑一致） |
-| 3 | 1 | 继续（与原逻辑一致） |
-| ≥4 | ≥2 | bail（与原逻辑一致） |
+| 1 | `0xFFFFFFFF` (underflow) | bail ★ the only behavior change |
+| 2 | 0 | continue (same as original) |
+| 3 | 1 | continue (same as original) |
+| >=4 | >=2 | bail (same as original) |
 
-bail 跳到函数唯一的 return，返回 `%r12d`（入口被 `xor %r12d,%r12d` 清零）
-⇒ **返回 0 = `CUDA_SUCCESS`**，驱动认为成功，不报错。
+bail jumps to the function's only return, returning `%r12d` (zeroed at entry
+by `xor %r12d,%r12d`)
+=> **returns 0 = `CUDA_SUCCESS`**; the driver considers it a success and
+reports no error.
 
-**怎么定位**（不用死记偏移）——32 字节签名，全文件唯一：
+**How to locate it** (no offsets to memorize) — a 32-byte signature, unique in
+the whole file:
 
 ```
 8d42ff 4156 4155 4989fd 4154 4531e4 53 4883ed40 48897510 89550c 83f802 0f87
 ```
 
-签名内两个位置要改：索引 `0x02` 的 `ff`→`fe`，索引 `0x1D` 的 `02`→`01`。
+Two positions inside the signature change: index `0x02` `ff`->`fe`, index
+`0x1D` `02`->`01`.
 
-> 文件偏移 = `.text` 节内偏移 + `0x40`。本版本 `.text` 内 `_nv017105rm` = `0x127d60`，
-> 对应文件偏移 `0x127da6`。
+> File offset = offset within `.text` + `0x40`. For this version `_nv017105rm`
+> is at `0x127d60` inside `.text`, corresponding to file offset `0x127da6`.
 
-md5：`7f6805ed…` → `514de9d4…`
+md5: `7f6805ed…` -> `514de9d4…`
 
-### 00：nv-kernel.o_binary，10 字节
+### 00: nv-kernel.o_binary, 10 bytes
 
-里面有一张「受限设备表」，条目形如 `0x0007XXXX`（低 16 位 = device ID）。
-本版本表在**文件偏移 `0x5CFDFCC`**，连续 5 个 dword，**5 张全是受限矿卡**：
+It contains a "restricted device table" with entries shaped like `0x0007XXXX`
+(low 16 bits = device ID). For this version the table sits at **file offset
+`0x5CFDFCC`**, 5 consecutive dwords, **all 5 restricted mining cards**:
 
-| 偏移 | 原值 | 设备 | |
+| offset | original | device | |
 |---|---|---|---|
 | `+0x00` | `0x00071B07` | P102-100 | |
-| `+0x04` | `0x00071B87` | **P104-100** | ★ 本项目这张卡 |
+| `+0x04` | `0x00071B87` | **P104-100** | ★ this project's card |
 | `+0x08` | `0x00071BC7` | P104-101 | |
 | `+0x0C` | `0x00071C07` | P106-100 | |
 | `+0x10` | `0x00071C09` | P106-090 | |
 
-> 打上补丁后 5 个都变成 `0x0007FFFF`，**光看当前文件认不出原来是哪张卡**。
-> `00-whitelist.sh check` 会从 `.orig` 备份读原始 ID 并逐条列出来
-> （见 `docs/故障排查.md` 的「看不出表里有哪些设备」）。
+> After patching, all 5 become `0x0007FFFF`; **the current file alone cannot
+> tell which card each entry was**. `00-whitelist.sh check` reads the original
+> IDs from the `.orig` backup and lists them one by one
+> (see `docs/troubleshooting.md` under "which devices the table holds").
 
-低 16 位改成 `0xFFFF`（哨兵，等于把卡从表里抹掉）：
-
-```
-07 1B 07 00  →  FF FF 07 00    87 1B 07 00  →  FF FF 07 00
-c7 1B 07 00  →  FF FF 07 00    07 1C 07 00  →  FF FF 07 00
-09 1C 07 00  →  FF FF 07 00
-```
-
-md5（`nv-kernel.o_binary`）：`caa613d3…` → `f3480248…`
-
-**Linux 只有内核一处** —— `libnvidia-glcore.so` 里不含这张表（搜 P1XX 的 ID 串 0 处）。
-Windows 才需要在 6+ 个文件里重复替换（每个 UMD 各带一份副本）。
-
-### 02：模块做什么
-
-在 `nv_pci_probe` 上挂 kretprobe，在 probe **返回的瞬间**：
+The low 16 bits become `0xFFFF` (a sentinel, effectively erasing the card from
+the table):
 
 ```
-① 解锁端点声明
-   0x8E110/0x8E11C/0x8E120/0x8E12C  →  XP3G 槽
-   0x8841C  →  (读值 | bit11|13|15) & ~(bit12|14)
-   0x88610  →  (读值 & ~bit12) | 1
-   0x8C2C0  →  清 bit2 (DIS_G2)
-   0x8872C = 6  →  触发训练，LNKCAP2 当场从 0x02 变 0x06
-
-② 写 SPEED=1（5.0GT/s）  0x8C040 的 SPEED[19:18] = 1，★ 绝不写 bit0(COMMIT)
-
-③ 两端 TLS=2，从根端口 Retrain
+07 1B 07 00  ->  FF FF 07 00    87 1B 07 00  ->  FF FF 07 00
+c7 1B 07 00  ->  FF FF 07 00    07 1C 07 00  ->  FF FF 07 00
+09 1C 07 00  ->  FF FF 07 00
 ```
 
-**为什么必须在 probe 返回的瞬间**：驱动在 probe 里会把这些位重置，
-早写会被覆盖；晚写则错过了链路训练窗口。kretprobe 是这个时机唯一可靠的抓手。
+md5 (`nv-kernel.o_binary`): `caa613d3…` -> `f3480248…`
+
+**On Linux there is only one copy** — `libnvidia-glcore.so` does not contain
+this table (0 hits for the P1XX ID strings). Only Windows needs the
+replacement repeated across 6+ files (each UMD carries its own copy).
+
+### 02: what the module does
+
+It attaches a kretprobe to `nv_pci_probe` and, at the **instant probe
+returns**:
+
+```
+① unlock the endpoint declaration
+   0x8E110/0x8E11C/0x8E120/0x8E12C  ->  XP3G slots
+   0x8841C  ->  (value | bit11|13|15) & ~(bit12|14)
+   0x88610  ->  (value & ~bit12) | 1
+   0x8C2C0  ->  clear bit2 (DIS_G2)
+   0x8872C = 6  ->  trigger training; LNKCAP2 flips from 0x02 to 0x06 on the spot
+
+② write SPEED=1 (5.0GT/s)  0x8C040's SPEED[19:18] = 1, ★ never write bit0 (COMMIT)
+
+③ TLS=2 on both ends; retrain from the root port
+```
+
+**Why at the instant probe returns**: the driver resets these bits inside
+probe; writing earlier gets overwritten, writing later misses the link
+training window. A kretprobe is the only reliable hook for this timing.
 
 ---
 
-## 八、风险
+## 8. Risks
 
-| 风险 | 说明 |
+| risk | description |
 |---|---|
-| 改动闭源二进制 | 可能违反 NVIDIA 许可条款 |
-| 版本绑定 | 换驱动版本必须重新定位，**不要复用这里的数字** |
-| whitelist 改设备身份 | 影响范围比 `gen2` 大，可能影响未验证的代码路径 |
-| 驱动升级会覆盖 | 两个补丁都会丢失，需重打 |
+| modifying a closed-source binary | may violate NVIDIA's license terms |
+| version-bound | switching driver versions requires re-locating; **do not reuse these numbers** |
+| whitelist alters device identity | broader blast radius than `gen2`; may affect unverified code paths |
+| driver upgrades overwrite | both patches are lost and must be reapplied |
 
-**动手前先读** `../../docs/安全纪律.md`。
+**Read `../../docs/safety-discipline.md` before doing anything.**
