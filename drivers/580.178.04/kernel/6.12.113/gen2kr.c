@@ -15,6 +15,24 @@
  *   The first attempt did everything in the handler and triggered "BUG: scheduling while atomic".
  *   Now the handler only does schedule_delayed_work; the real work happens in a workqueue.
  *
+ * ★ Multi-GPU adaptation (2026-11-13, this server: 3 × P104-100 under load):
+ *   The original targeted exactly one GPU -- pci_get_device() always returns the FIRST P104
+ *   in PCI order, so pushes aimed at 0000:21:00.0 / 0000:27:00.0 landed on 04:00.0 by mistake.
+ *   Now every P104 is tracked in a per-device table:
+ *   - the kretprobe's entry handler captures WHICH device was probed (nv_pci_probe's first
+ *     argument) and each device is pushed exactly once per module load (the old one-shot
+ *     `triggered` flag, per device);
+ *   - push_fn processes the queued devices sequentially in one work item -- one link trains
+ *     at a time, never several;
+ *   - the guard walks the whole table each round but only touches devices whose declaration
+ *     is unlocked (CAP2 latched 0x0006) and whose TLS is not the dirty 3 -- a factory device
+ *     is never written by the guard, and the gate is stateless, so devices pushed by a
+ *     previous module load stay covered after a re-insmod;
+ *   - BAR0 of every device is pre-mapped at init (the old single `early_bar`), so the atomic
+ *     fast path still writes through a sleeping-free mapping.
+ *   The push sequence, register writes, timing constants and dmesg lines are byte-for-byte
+ *   the validated ones; only the targeting changed.
+ *
  * Sequence (following the reference patch, adapted for Pascal):
  *   ① Unlock declaration: XP3G_OVR0/3 + VAL0/3 + 0x8841C + 0x88610
  *   ② Clear 0x8C2C0 bit2 (DIS_G2)
@@ -27,6 +45,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
+#include <linux/ptrace.h>
 #include <linux/pci.h>
 #include <linux/pci_regs.h>
 #include <linux/delay.h>
@@ -45,6 +64,7 @@
 #define OFF_CONFIG     0x8841C   /* PRIV_MISC_1 */
 #define OFF_VSEC       0x88610   /* VSEC_HIERARCHY */
 #define OFF_CAP2       0x880A4   /* LINK_CAP2 mirror */
+#define OFF_LNKCTL2    0x880A8   /* LNKCTL2 mirror, TLS=bits[3:0] */
 #define OFF_LTSSM      0x8872C   /* XVE_OVR */
 #define OFF_LINKCFG0   0x8C040   /* LINK_CONFIG_0 */
 #define OFF_CYA        0x8C2C0   /* CYA_0, bit2 = DIS_G2 */
@@ -55,15 +75,52 @@ module_param(guard_rounds, int, 0644);
 MODULE_PARM_DESC(guard_rounds, "guard rounds; 0=resident (default)");
 
 static struct kretprobe krp;
-static bool triggered;
-static void __iomem *early_bar;      /* pre-mapped at init, used directly in the handler (no sleeping) */
+
+/*
+ * ★ Per-device state (multi-GPU adaptation, 2026-11-13):
+ *   The original code tracked exactly one GPU -- pci_get_device() always returns the FIRST
+ *   P104 in PCI order, so a push aimed at 0000:21:00.0 / 0000:27:00.0 landed on 04:00.0 by
+ *   mistake. Now every P104 in the system gets one entry:
+ *   - `bar` is pre-mapped at init (the old `early_bar`), so the atomic fast path still
+ *     writes without sleeping;
+ *   - `pushed` is the old one-shot `triggered` flag, per device;
+ *   - the guard state below used to be file-global -- it is per device now.
+ */
+#define GK_MAX_DEVS 8
+
+struct gk_dev {
+    struct pci_dev *gpu;            /* reference held until module exit */
+    void __iomem *bar;              /* pre-mapped BAR0, used directly in the handler (no sleeping) */
+    bool pushed;                    /* one-shot per device: this module load already pushed it */
+    bool pending;                   /* queued for the push workqueue */
+    bool tls_bad_logged;            /* suppress repeat warnings of the TLS=3 dirty state */
+    int guard_left;                 /* per-device guard rounds (finite mode) */
+    unsigned long last_retrain_jiffies;
+    /*
+     * ★ Timestamp of the last "push SPEED back".
+     *   Iron rule (reports/186 #1): after writing SPEED you must wait >=3s before retraining,
+     *   or the retrain is wasted (millisecond-scale retrains can even deadlock).
+     *   Measured: retraining within 1 second after the guard pushed SPEED back left LNKSTA at 1041.
+     */
+    unsigned long last_speed_fix_jiffies;
+    unsigned long stage_start_jiffies;  /* timestamp of stage0, used to compute stage_gap_ms */
+    unsigned long last_attempt_jiffies; /* timestamp of the last full attempt (stage0) */
+    int retrain_stage;
+    int low_streak;                 /* consecutive Gen1 reads (debounce counter) */
+    bool bad_read_logged;           /* suppress repeat warnings of "read 0xffffffff" */
+};
+
+static struct gk_dev gk_devs[GK_MAX_DEVS];
+static int gk_n;                    /* P104s found at init */
+
+/* kretprobe instance data: which device was probed (nv_pci_probe's first argument) */
+struct gk_ctx {
+    struct pci_dev *pdev;
+};
 
 static struct delayed_work gen2_work;
-static int guard_left;
 static int pushback_cnt;
 static int retrain_cnt;
-static bool bad_read_logged;    /* suppress repeat warnings of "read 0xffffffff" */
-static bool pushing;
 
 /* ---------- Safety-constraint parameters (reports/185: an unconstrained guard once
  *            knocked the whole machine over) ---------- */
@@ -124,32 +181,7 @@ MODULE_PARM_DESC(allow_busy_retrain, "1=also retrain while the GPU is busy (defa
 module_param(guard_period_ms, int, 0644);
 MODULE_PARM_DESC(guard_period_ms, "guard period in ms, default 200");
 
-/* ---------- Guard state ---------- */
-static unsigned long last_retrain_jiffies;
-/*
- * ★ Timestamp of the last "push SPEED back".
- *   Iron rule (reports/186 #1): after writing SPEED you must wait >=3s before retraining,
- *   or the retrain is wasted (millisecond-scale retrains can even deadlock).
- *   Measured: retraining within 1 second after the guard pushed SPEED back left LNKSTA at 1041.
- */
-static unsigned long last_speed_fix_jiffies;
-
-/*
- * ★ The two retrain steps (reports/186 recipe, interval corrected in reports/196):
- *     Step 1: write 0x8872C = 6   (triggers LTSSM training, asynchronous)
- *     Step 2: Retrain from the root port (so the negotiation actually happens)
- *
- *   Step 2 alone measured ineffective: the old guard retrained 16 times, LNKSTA stayed 1041.
- *
- *   ★ But the interval between the two steps is **not 3 seconds** (corrected in reports/196):
- *     push_fn succeeded in one shot with msleep(50) (LNKSTA=1042 within 104ms);
- *     the early guard used retrain_min_ms (2000) as the stage interval and failed 4 rounds straight.
- *     Now a separate stage_gap_ms (150) is used, and stage1 no longer re-enters the debounce path.
- */
-static int retrain_stage;
-static unsigned long stage_start_jiffies;  /* timestamp of stage0, used to compute stage_gap_ms */
-static unsigned long last_attempt_jiffies; /* timestamp of the last full attempt (stage0) */
-static int low_streak;              /* consecutive Gen1 reads (debounce counter) */
+/* ---------- Guard state: per device since the multi-GPU adaptation (struct gk_dev) ---------- */
 
 
 /*
@@ -207,156 +239,201 @@ static bool guard_enabled = true;
 module_param(guard_enabled, bool, 0644);
 MODULE_PARM_DESC(guard_enabled, "master switch; 0=the guard does nothing at all (only the initial push)");
 
-/* ---------- Phase 2: the guard (safe version) ---------- */
-static void guard_fn(struct work_struct *w)
+/*
+ * ★ The two retrain steps (reports/186 recipe, interval corrected in reports/196):
+ *     Step 1: write 0x8872C = 6   (triggers LTSSM training, asynchronous)
+ *     Step 2: Retrain from the root port (so the negotiation actually happens)
+ *
+ *   Step 2 alone measured ineffective: the old guard retrained 16 times, LNKSTA stayed 1041.
+ *
+ *   ★ But the interval between the two steps is **not 3 seconds** (corrected in reports/196):
+ *     push_fn succeeded in one shot with msleep(50) (LNKSTA=1042 within 104ms);
+ *     the early guard used retrain_min_ms (2000) as the stage interval and failed 4 rounds straight.
+ *     Now a separate stage_gap_ms (150) is used, and stage1 no longer re-enters the debounce path.
+ */
+static void gk_guard_one(struct gk_dev *d)
 {
-    struct pci_dev *gpu;
-    void __iomem *bar;
+    struct pci_dev *gpu = d->gpu;
+    struct pci_dev *up;
+    void __iomem *bar = d->bar;
     u32 v, lk;
     u16 st = 0;
     bool low;
 
-    if (guard_left == 0 && guard_rounds > 0)
+    if (!bar)
         return;
-    if (guard_left > 0)
-        guard_left--;
 
-    gpu = pci_get_device(NV_VENDOR, NV_DEV_P104, NULL);
-    if (!gpu)
-        goto next;
+    v = readl(bar + OFF_CAP2);
+    if (v == 0xFFFFFFFFu)
+        return;
 
-    bar = ioremap(pci_resource_start(gpu, 0), BAR0_LEN);
-    if (bar) {
-        v = readl(bar + OFF_CAP2);
-        if (v == 0xFFFFFFFFu)
-            goto unmap;
+    /*
+     * ★ Multi-GPU gate: only guard a device whose declaration is unlocked -- CAP2 latches
+     *   0x0006 after a successful push (or an equivalent user-space unlock). A factory
+     *   device (CAP2 == 0x0002) must never be written by the guard, and a stuck device is
+     *   exactly what reports/198 concluded only a full reboot can cure. The gate is
+     *   stateless on purpose: it also keeps covering devices pushed by a PREVIOUS module
+     *   load (e.g. after push.sh's rmmod/insmod cycle for the next GPU).
+     */
+    if (v != 0x00000006u)
+        return;
 
-        /* ① Push SPEED back (a tiny pure-MMIO write, no side effects, safe to do every round) */
-        lk = readl(bar + OFF_LINKCFG0);
-        /*
-         * ★★★ Triple check, all three mandatory (reports/196 -- this was the root cause of a
-         *      real lost card)
-         *
-         * We used to only check CAP2 != 0xffffffff and confidently push SPEED back. But LINKCFG0
-         * itself can also transiently read 0xffffffff during a link retrain, in which case:
-         *     0xFFFFFFFF & ~0x000C0000 = 0xFFF3FFFF
-         *     0xFFF3FFFF | (1 << 18)   = 0xFFF7FFFF
-         *                                    ^ bit0 = 1 = COMMIT -> guaranteed lost card!
-         * Measured cost: the device went into C. ZOMBIE; only a full reboot helps.
-         *
-         * So: ① it must not be 0xffffffff ② bit0 (COMMIT) must be 0 ③ only then look at the
-         * SPEED bits
-         */
-        if (lk == 0xFFFFFFFFu) {
-            if (!bad_read_logged) {
-                pr_warn("gen2kr: [guard] LINKCFG0 read 0xffffffff, skipping this round's push-back\n");
-                bad_read_logged = true;
-            }
-            goto unmap;
+    /* ★ TLS=3 is the dirty state only a cold boot recovers from -- never touch it
+     *   (read+skip only, no writes, so this check cannot make anything worse) */
+    v = readl(bar + OFF_LNKCTL2);
+    if ((v & 0xF) == 3) {
+        if (!d->tls_bad_logged) {
+            pr_warn("gen2kr: [guard] %s sits in the dirty TLS=3 state; refusing to touch it (a full reboot is the only cure)\n",
+                    dev_name(&gpu->dev));
+            d->tls_bad_logged = true;
         }
-        bad_read_logged = false;
-        if ((lk & 1u) != 0) {
-            /* The COMMIT bit is set -- never write back on top of it, only warn */
-            pr_warn_ratelimited("gen2kr: [guard] LINKCFG0 bit0(COMMIT)=1, refusing to write back (lk=%08x)\n", lk);
-            goto unmap;
-        }
-        if (((lk >> 18) & 0x3) != 1) {
-            writel((lk & ~0x000C0000u) | (1u << 18), bar + OFF_LINKCFG0);
-            last_speed_fix_jiffies = jiffies;
-            pushback_cnt++;
-            pr_info_ratelimited("gen2kr: [guard] SPEED pushed back to 1 (count %d, was %08x)\n",
-                                pushback_cnt, lk);
-        }
-
-        /* ② Has the link really dropped to Gen1 -- only consider a retrain when "stably low" */
-        if (pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &st))
-            goto unmap;
-        low = (st & PCI_EXP_LNKSTA_CLS) < PCI_EXP_LNKSTA_CLS_5_0GB;
-
-        if (!low) {
-            low_streak = 0;          /* already fine, reset */
-            retrain_stage = 0;       /* ★ also reset the stage so the next drop does not jump straight to Retrain */
-            goto unmap;
-        }
-        low_streak++;
-
-        if (!guard_enabled)
-            goto unmap;
-
-        /* ============ stage 1: second step of the same attempt, no re-debouncing ============ */
-        if (retrain_stage == 1) {
-            struct pci_dev *up;
-            u16 ctl = 0;
-
-            /* Only wait stage_gap_ms (mimicking push_fn's msleep(50) + margin) */
-            if (time_before(jiffies,
-                            stage_start_jiffies + msecs_to_jiffies(stage_gap_ms)))
-                goto unmap;
-
-            up = pci_upstream_bridge(gpu);
-            if (up && !pcie_capability_read_word(up, PCI_EXP_LNKCTL, &ctl)) {
-                pcie_capability_write_word(up, PCI_EXP_LNKCTL,
-                                           ctl | PCI_EXP_LNKCTL_RL);
-                pr_info("gen2kr: [guard] root-port Retrain (LNKSTA=%04x, stage interval %dms)\n",
-                        st, stage_gap_ms);
-            }
-            retrain_stage = 0;
-            low_streak = 0;
-            goto unmap;
-        }
-
-        /* ============ stage 0: the full triple gate is required ============ */
-        if (low_streak < debounce_cnt)
-            goto unmap;
-
-        /*
-         * ★ We once tried adding "precondition self-healing" here (TLS / declaration), and rolled
-         *    it back (reports/198 §failed experiment)
-         *
-         * The idea: after a driver reload the endpoint TLS is clamped back to 1 and the
-         * declaration resets to Gen1, so the guard would rewrite TLS=2 here and re-unlock the
-         * declaration.
-         * Measured: **ineffective**.
-         *   - Right after writing TLS 2 it reads back 1 (`endpoint TLS2 0001 -> 0002` repeated
-         *     every 600ms, and the next round read 0001 again) -- the driver clamps it; we lose
-         *     the race
-         *   - After unlocking the declaration CAP2 still read 0x0002 (CAP2 only latches after
-         *     0x8872C=6, and even with training triggered it could not be rescued)
-         *   - 6 rounds of unbind/bind + 9 unlock attempts, the link stayed LNKSTA=1 throughout
-         *   - And hammering the config space every 600ms is risky in itself
-         * => rolled back. The right fix is a full reboot to a clean state (see the reports/198
-         *    conclusion).
-         */
-        if (time_before(jiffies,
-                        last_attempt_jiffies + msecs_to_jiffies(retrain_min_ms)))
-            goto unmap;
-        /* ★ After pushing SPEED back you must wait long enough, or the retrain is wasted
-         *   (reports/186 iron rule #1) */
-        if (time_before(jiffies,
-                        last_speed_fix_jiffies + msecs_to_jiffies(speed_settle_ms)))
-            goto unmap;
-        if (!allow_busy_retrain && gpu_busy()) {
-            pr_info_ratelimited("gen2kr: [guard] GPU busy, skipping the retrain this round\n");
-            goto unmap;
-        }
-
-        /* Step 1: trigger LTSSM training */
-        writel(0x00000006, bar + OFF_LTSSM);
-        retrain_stage = 1;
-        stage_start_jiffies = jiffies;
-        last_attempt_jiffies = jiffies;
-        last_retrain_jiffies = jiffies;
-        low_streak = 0;
-        retrain_cnt++;
-        pr_info("gen2kr: [guard] triggered training 0x8872C=6 (global count %d, LNKSTA=%04x)\n",
-                retrain_cnt, st);
-unmap:
-        iounmap(bar);
+        return;
     }
-    pci_dev_put(gpu);
 
-next:
-    if (guard_rounds > 0 && guard_left <= 0) {
+    /* ① Push SPEED back (a tiny pure-MMIO write, no side effects, safe to do every round) */
+    lk = readl(bar + OFF_LINKCFG0);
+    /*
+     * ★★★ Triple check, all three mandatory (reports/196 -- this was the root cause of a
+     *      real lost card)
+     *
+     * We used to only check CAP2 != 0xffffffff and confidently push SPEED back. But LINKCFG0
+     * itself can also transiently read 0xffffffff during a link retrain, in which case:
+     *     0xFFFFFFFF & ~0x000C0000 = 0xFFF3FFFF
+     *     0xFFF3FFFF | (1 << 18)   = 0xFFF7FFFF
+     *                                    ^ bit0 = 1 = COMMIT -> guaranteed lost card!
+     * Measured cost: the device went into C. ZOMBIE; only a full reboot helps.
+     *
+     * So: ① it must not be 0xffffffff ② bit0 (COMMIT) must be 0 ③ only then look at the
+     * SPEED bits
+     */
+    if (lk == 0xFFFFFFFFu) {
+        if (!d->bad_read_logged) {
+            pr_warn("gen2kr: [guard] LINKCFG0 read 0xffffffff, skipping this round's push-back\n");
+            d->bad_read_logged = true;
+        }
+        return;
+    }
+    d->bad_read_logged = false;
+    if ((lk & 1u) != 0) {
+        /* The COMMIT bit is set -- never write back on top of it, only warn */
+        pr_warn_ratelimited("gen2kr: [guard] LINKCFG0 bit0(COMMIT)=1, refusing to write back (lk=%08x)\n", lk);
+        return;
+    }
+    if (((lk >> 18) & 0x3) != 1) {
+        pr_info("gen2kr: [guard] device %s\n", dev_name(&gpu->dev));
+        writel((lk & ~0x000C0000u) | (1u << 18), bar + OFF_LINKCFG0);
+        d->last_speed_fix_jiffies = jiffies;
+        pushback_cnt++;
+        pr_info_ratelimited("gen2kr: [guard] SPEED pushed back to 1 (count %d, was %08x)\n",
+                            pushback_cnt, lk);
+    }
+
+    /* ② Has the link really dropped to Gen1 -- only consider a retrain when "stably low" */
+    if (pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &st))
+        return;
+    low = (st & PCI_EXP_LNKSTA_CLS) < PCI_EXP_LNKSTA_CLS_5_0GB;
+
+    if (!low) {
+        d->low_streak = 0;          /* already fine, reset */
+        d->retrain_stage = 0;       /* ★ also reset the stage so the next drop does not jump straight to Retrain */
+        return;
+    }
+    d->low_streak++;
+
+    if (!guard_enabled)
+        return;
+
+    /* ============ stage 1: second step of the same attempt, no re-debouncing ============ */
+    if (d->retrain_stage == 1) {
+        u16 ctl = 0;
+
+        /* Only wait stage_gap_ms (mimicking push_fn's msleep(50) + margin) */
+        if (time_before(jiffies,
+                        d->stage_start_jiffies + msecs_to_jiffies(stage_gap_ms)))
+            return;
+
+        up = pci_upstream_bridge(gpu);
+        if (up && !pcie_capability_read_word(up, PCI_EXP_LNKCTL, &ctl)) {
+            pr_info("gen2kr: [guard] device %s\n", dev_name(&gpu->dev));
+            pcie_capability_write_word(up, PCI_EXP_LNKCTL,
+                                       ctl | PCI_EXP_LNKCTL_RL);
+            pr_info("gen2kr: [guard] root-port Retrain (LNKSTA=%04x, stage interval %dms)\n",
+                    st, stage_gap_ms);
+        }
+        d->retrain_stage = 0;
+        d->low_streak = 0;
+        return;
+    }
+
+    /* ============ stage 0: the full triple gate is required ============ */
+    if (d->low_streak < debounce_cnt)
+        return;
+
+    /*
+     * ★ We once tried adding "precondition self-healing" here (TLS / declaration), and rolled
+     *    it back (reports/198 §failed experiment)
+     *
+     * The idea: after a driver reload the endpoint TLS is clamped back to 1 and the
+     * declaration resets to Gen1, so the guard would rewrite TLS=2 here and re-unlock the
+     * declaration.
+     * Measured: **ineffective**.
+     *   - Right after writing TLS 2 it reads back 1 (`endpoint TLS2 0001 -> 0002` repeated
+     *     every 600ms, and the next round read 0001 again) -- the driver clamps it; we lose
+     *     the race
+     *   - After unlocking the declaration CAP2 still read 0x0002 (CAP2 only latches after
+     *     0x8872C=6, and even with training triggered it could not be rescued)
+     *   - 6 rounds of unbind/bind + 9 unlock attempts, the link stayed LNKSTA=1 throughout
+     *   - And hammering the config space every 600ms is risky in itself
+     * => rolled back. The right fix is a full reboot to a clean state (see the reports/198
+     *    conclusion).
+     */
+    if (time_before(jiffies,
+                    d->last_attempt_jiffies + msecs_to_jiffies(retrain_min_ms)))
+        return;
+    /* ★ After pushing SPEED back you must wait long enough, or the retrain is wasted
+     *   (reports/186 iron rule #1) */
+    if (time_before(jiffies,
+                    d->last_speed_fix_jiffies + msecs_to_jiffies(speed_settle_ms)))
+        return;
+    if (!allow_busy_retrain && gpu_busy()) {
+        pr_info_ratelimited("gen2kr: [guard] GPU busy, skipping the retrain this round\n");
+        return;
+    }
+
+    /* Step 1: trigger LTSSM training */
+    pr_info("gen2kr: [guard] device %s\n", dev_name(&gpu->dev));
+    writel(0x00000006, bar + OFF_LTSSM);
+    d->retrain_stage = 1;
+    d->stage_start_jiffies = jiffies;
+    d->last_attempt_jiffies = jiffies;
+    d->last_retrain_jiffies = jiffies;
+    d->low_streak = 0;
+    retrain_cnt++;
+    pr_info("gen2kr: [guard] triggered training 0x8872C=6 (global count %d, LNKSTA=%04x)\n",
+            retrain_cnt, st);
+}
+
+static void guard_fn(struct work_struct *w)
+{
+    int i;
+    bool alive = false;
+
+    /* One shared guard walks every tracked device; each device has its own
+     * finite-mode budget (d->guard_left). */
+    for (i = 0; i < gk_n; i++) {
+        struct gk_dev *d = &gk_devs[i];
+
+        if (guard_rounds > 0) {
+            if (d->guard_left == 0)
+                continue;               /* this device's guard has finished */
+            d->guard_left--;
+        }
+        alive = true;
+
+        gk_guard_one(d);
+    }
+
+    if (guard_rounds > 0 && !alive) {
         pr_info("gen2kr: guard finished, %d SPEED push-backs and %d retrains in total\n",
                 pushback_cnt, retrain_cnt);
         return;
@@ -365,28 +442,21 @@ next:
 }
 
 /* ---------- Phase 1: the actual Gen2 push (in a workqueue, may sleep) ---------- */
-static void push_fn(struct work_struct *w)
+static void gk_push_one(struct gk_dev *d)
 {
-    struct pci_dev *gpu;
+    struct pci_dev *gpu = d->gpu;
     struct pci_dev *up;
-    void __iomem *bar;
+    void __iomem *bar = d->bar;
     u32 v;
     u16 ctl2, ctl, sta = 0;
     int i;
 
-    pushing = false;
-    gpu = pci_get_device(NV_VENDOR, NV_DEV_P104, NULL);
-    if (!gpu) {
-        pr_warn("gen2kr: P104 not found\n");
+    if (!bar) {
+        pr_err("gen2kr: ioremap failed\n");
         return;
     }
 
-    bar = ioremap(pci_resource_start(gpu, 0), BAR0_LEN);
-    if (!bar) {
-        pr_err("gen2kr: ioremap failed\n");
-        goto put;
-    }
-
+    pr_info("gen2kr: [push] device %s\n", dev_name(&gpu->dev));
     pr_info("gen2kr: [push] start cap2=%08x config=%08x lnkcfg0=%08x\n",
             readl(bar + OFF_CAP2), readl(bar + OFF_CONFIG),
             readl(bar + OFF_LINKCFG0));
@@ -425,7 +495,6 @@ static void push_fn(struct work_struct *w)
     pr_info("gen2kr: [push] after writes cap2=%08x config=%08x lnkcfg0=%08x cya=%08x\n",
             readl(bar + OFF_CAP2), readl(bar + OFF_CONFIG),
             readl(bar + OFF_LINKCFG0), readl(bar + OFF_CYA));
-    iounmap(bar);
 
     /* The reference patch's msleep(50) */
     msleep(50);
@@ -469,65 +538,129 @@ static void push_fn(struct work_struct *w)
     if (i == 20)
         pr_warn("gen2kr: no speed-up, LNKSTA=%04x\n", sta);
 
-    /* ⑦ Start the guard */
-    last_retrain_jiffies = jiffies;
-    last_attempt_jiffies = jiffies;
-    stage_start_jiffies = jiffies;
-    retrain_stage = 0;
-    low_streak = 0;
-    guard_left = (guard_rounds > 0) ? guard_rounds : 1;
-    schedule_delayed_work(&gen2_work, msecs_to_jiffies(100));
+    /* ⑦ Arm this device's guard state (the shared guard work is (re)started by push_fn) */
+    d->last_retrain_jiffies = jiffies;
+    d->last_attempt_jiffies = jiffies;
+    d->stage_start_jiffies = jiffies;
+    d->retrain_stage = 0;
+    d->low_streak = 0;
+    d->guard_left = (guard_rounds > 0) ? guard_rounds : 1;
+}
 
-put:
-    pci_dev_put(gpu);
+static void push_fn(struct work_struct *w)
+{
+    int i;
+    bool pushed_any = false;
+
+    /* Process the queued devices sequentially -- one link trains at a time, never several. */
+    for (i = 0; i < gk_n; i++) {
+        struct gk_dev *d = &gk_devs[i];
+
+        if (!d->pending)
+            continue;
+        d->pending = false;
+        gk_push_one(d);
+        pushed_any = true;
+    }
+
+    if (pushed_any)
+        schedule_delayed_work(&gen2_work, msecs_to_jiffies(100));
 }
 
 static DECLARE_WORK(push_work, push_fn);
 
-/* ---------- kretprobe handler: schedules only, does nothing itself ---------- */
+static struct gk_dev *gk_find(struct pci_dev *pdev)
+{
+    int i;
+
+    for (i = 0; i < gk_n; i++)
+        if (gk_devs[i].gpu == pdev)
+            return &gk_devs[i];
+    return NULL;
+}
+
+/* ---------- kretprobe handlers: schedule only, do nothing themselves ---------- */
+
+/* ★ The entry handler records WHICH device was probed (nv_pci_probe's first argument) --
+ *   that is the whole point of the multi-GPU adaptation: the return handler used to blindly
+ *   target the first P104 in PCI order. */
+static int gk_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    ((struct gk_ctx *)ri->data)->pdev =
+        (struct pci_dev *)regs_get_kernel_argument(regs, 0);
+    return 0;
+}
+
 static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    struct gk_ctx *ctx = (struct gk_ctx *)ri->data;
+    struct gk_dev *d;
     u32 lk;
 
-    if (triggered)
+    d = gk_find(ctx->pdev);
+    if (!d) {
+        if (ctx->pdev &&
+            ctx->pdev->vendor == NV_VENDOR && ctx->pdev->device == NV_DEV_P104)
+            pr_warn_ratelimited("gen2kr: P104 %s probed but not tracked (table full); skipping\n",
+                                dev_name(&ctx->pdev->dev));
         return 0;
-    triggered = true;
+    }
+    if (d->pushed)
+        return 0;
+    d->pushed = true;
+
+    pr_info("gen2kr: probe returned for %s\n", dev_name(&d->gpu->dev));
 
     /* ★ Ultra-fast path: write SPEED directly through the pre-mapped BAR0 (writel only,
      *   no sleeping)
      *   Measured: the workqueue-only version lands a few ticks late and misses the window
      *   right after the probe returns; doing it directly in atomic context actually
      *   succeeded once (LNKSTA=1042). */
-    if (early_bar) {
-        lk = readl(early_bar + OFF_LINKCFG0);
+    if (d->bar) {
+        lk = readl(d->bar + OFF_LINKCFG0);
         /* ★ The COMMIT guard is equally mandatory here (reports/196): checking for ffffffff
          *   alone is not enough -- if lk's bit0 is already 1, pushing SPEED back would write
          *   COMMIT along with it -> lost card */
         if (lk != 0xFFFFFFFFu && (lk & 1u) == 0) {
-            writel((lk & ~0x000C0000u) | (1u << 18), early_bar + OFF_LINKCFG0);
-            writel(0x00000006, early_bar + OFF_LTSSM);
+            writel((lk & ~0x000C0000u) | (1u << 18), d->bar + OFF_LINKCFG0);
+            writel(0x00000006, d->bar + OFF_LTSSM);
             pr_info("gen2kr: [fast] wrote SPEED=1 directly, %08x -> %08x\n",
-                    lk, readl(early_bar + OFF_LINKCFG0));
+                    lk, readl(d->bar + OFF_LINKCFG0));
         } else {
             pr_warn("gen2kr: [fast] LINKCFG0=%08x not trustworthy, skipping the direct write (handing over to the workqueue)\n", lk);
         }
     }
 
-    if (!pushing) {
-        pushing = true;
-        schedule_work(&push_work);
-        pr_info("gen2kr: nv_pci_probe has returned; retrain queued\n");
-    }
+    d->pending = true;
+    schedule_work(&push_work);
+    pr_info("gen2kr: nv_pci_probe has returned; retrain queued\n");
     return 0;
+}
+
+static void gk_release_devices(void)
+{
+    int i;
+
+    for (i = 0; i < gk_n; i++) {
+        if (gk_devs[i].bar)
+            iounmap(gk_devs[i].bar);
+        if (gk_devs[i].gpu)
+            pci_dev_put(gk_devs[i].gpu);
+    }
+    gk_n = 0;
 }
 
 static int __init gen2kr_init(void)
 {
     int ret;
+    struct pci_dev *from = NULL;
+    struct pci_dev *dev;
 
     memset(&krp, 0, sizeof(krp));
     krp.kp.symbol_name = "nv_pci_probe";
     krp.handler = ret_handler;
+    krp.entry_handler = gk_entry_handler;
+    krp.data_size = sizeof(struct gk_ctx);
     krp.maxactive = 4;
 
     INIT_DELAYED_WORK(&gen2_work, guard_fn);
@@ -543,21 +676,38 @@ static int __init gen2kr_init(void)
         }
     }
 
-    /* Pre-map BAR0 so the handler can write without sleeping */
-    {
-        struct pci_dev *g = pci_get_device(NV_VENDOR, NV_DEV_P104, NULL);
-        if (g) {
-            early_bar = ioremap(pci_resource_start(g, 0), BAR0_LEN);
-            pr_info("gen2kr: pre-mapped BAR0 @ %llx -> %px\n",
-                    (unsigned long long)pci_resource_start(g, 0), early_bar);
-            pci_dev_put(g);
+    /* Build the per-device table: track EVERY P104, not just the first one. Pre-map each
+     * BAR0 so the atomic fast path can write without sleeping. */
+    while ((dev = pci_get_device(NV_VENDOR, NV_DEV_P104, from)) != NULL) {
+        struct gk_dev *d;
+
+        if (gk_n >= GK_MAX_DEVS) {
+            pr_warn("gen2kr: more than %d P104s present, ignoring the rest\n", GK_MAX_DEVS);
+            pci_dev_put(dev);
+            break;
         }
+
+        d = &gk_devs[gk_n++];
+        d->gpu = dev;      /* the table keeps this reference until module exit */
+        d->bar = ioremap(pci_resource_start(dev, 0), BAR0_LEN);
+        if (!d->bar)
+            pr_warn("gen2kr: BAR0 ioremap failed for %s; its push will be skipped\n",
+                    dev_name(&dev->dev));
+        pr_info("gen2kr: tracking %s\n", dev_name(&dev->dev));
+        pr_info("gen2kr: pre-mapped BAR0 @ %llx -> %px\n",
+                (unsigned long long)pci_resource_start(dev, 0), d->bar);
+
+        /* pci_get_device() consumes the reference of `from`, so pass a clone and keep
+         * the found device's own reference in the table */
+        from = pci_dev_get(dev);
     }
+    if (gk_n == 0)
+        pr_warn("gen2kr: P104 not found\n");
 
     ret = register_kretprobe(&krp);
     if (ret) {
         pr_err("gen2kr: register_kretprobe failed %d\n", ret);
-        if (early_bar) { iounmap(early_bar); early_bar = NULL; }
+        gk_release_devices();
         return ret;
     }
     pr_info("gen2kr: kretprobe attached on nv_pci_probe\n");
@@ -569,11 +719,11 @@ static void __exit gen2kr_exit(void)
     unregister_kretprobe(&krp);
     cancel_work_sync(&push_work);
     cancel_delayed_work_sync(&gen2_work);
-    if (early_bar) { iounmap(early_bar); early_bar = NULL; }
+    gk_release_devices();
     pr_info("gen2kr: unloaded\n");
 }
 
 module_init(gen2kr_init);
 module_exit(gen2kr_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Push NVIDIA P104-100 PCIe link to Gen2 after probe");
+MODULE_DESCRIPTION("Push NVIDIA P104-100 PCIe links to Gen2 after probe");
