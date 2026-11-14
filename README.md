@@ -169,7 +169,7 @@ zeroed by `xor` at entry, so it returns **0 = CUDA_SUCCESS**. The driver believe
 
 **Only 2 bytes change; every other instruction, every other branch, every other mode stays untouched.**
 
-### ② The gen2kr kernel module (only handles the first push)
+### ② The gen2kr kernel module (multi-GPU: tracks every P104, pushes one at a time)
 
 The patch only stops the driver from downgrading; the link still has to be raised first. That needs:
 - unlocking the endpoint's declaration (`0x8841C` etc.), so `LINK_CAP2` goes from `0x02` to `0x06`
@@ -180,6 +180,10 @@ The patch only stops the driver from downgrading; the link still has to be raise
 and touching the link afterwards only yields "link at Gen2 but bandwidth still Gen1" (the internal datapath stays configured for Gen1).
 
 `gen2kr.ko` attaches a `kretprobe` on `nv_pci_probe` and pushes at exactly that moment.
+On a multi-GPU machine it keeps a per-device table built at init, the entry handler records
+which device was probed, and each P104 is pushed exactly once per module load; queued pushes
+run sequentially (one link trains at a time), and the guard only touches devices whose
+declaration is already unlocked (`CAP2=0x0006`, never a factory device, never TLS=3).
 
 It also carries a guard (polls `LNKSTA` every 200 ms), but **with the patch in place the guard should be a no-op** —
 the guard is just a safety net (the patch is lost on driver upgrades; then the guard can pull the link back).
