@@ -1,38 +1,77 @@
 #!/bin/bash
 # ============================================================
-# push-all.sh — push SEVERAL P104 cards to Gen2 in one run, one card at a time
+# push-all.sh — push SEVERAL P104 cards to Gen2 in one run, in TWO passes,
+#               one card at a time
 #
 # ## Why this script exists
 #   push.sh handles exactly one TARGET_BDF per invocation. With three identical
-#   mining cards the operator had to run it by hand three times and keep track
-#   of which card was in which state. The 2026-11-14 session proved how easy
-#   that is to get wrong:
-#     · card 04:00.0 got two pushes and ended Gen2 (CAP2=0x0006, LNKSTA=1042);
-#     · cards 21:00.0 and 27:00.0 got exactly one push each and ended in the
-#       "half-pushed" state: CAP2=0x0002 + TLS=1 + declaration bits written.
-#   reports/198 measured that state as unrescuable (6 unbind/bind rounds and 9
-#   unlock attempts all failed; hammering also risks TLS=3, and the measured
-#   cure is a full reboot). A full reboot did exactly that -- it reset every
-#   card to the factory state (measured 2026-11-15 07:11 on this server),
-#   which is why this script REFUSES stuck cards and tells the operator to
-#   reboot instead of hammering.
+#   mining cards the operator had to run it by hand and keep track of which
+#   card was in which state -- and the 2026-11-14 version of THIS script got
+#   that wrong in an instructive way: it gave every factory card ONE cycle and
+#   then, watching the registers for 2 minutes, concluded "half-pushed,
+#   incurable, reboot" for the cards that did not finish. The mechanism below
+#   shows that conclusion was wrong on this machine: those cards were not
+#   stuck, they were ARMED AND NEVER RE-PROBED -- and one more cycle finishes
+#   each of them.
+#
+# ## The mechanism this script is built around (measured 2026-11-15)
+#   journalctl of both boots of this server (3/3 cards) pins down what a push
+#   actually does:
+#     · a push only ARMS the card: it writes the declaration bits of 0x8841C
+#       (0xc0b46500 -> 0xc0b4ad00), moves the endpoint TLS to 2, the root-port
+#       TLS2 to 2 + Retrain, XVE_OVR=6 and the [fast] hook's SPEED=1 write --
+#       but CAP2 (0x880A4) does NOT latch during that cycle;
+#     · CAP2 latches ONLY at the card's NEXT probe: nv_pci_probe re-inits the
+#       link and re-samples the downstream announcement, and only then does
+#       CAP2 flip to 0x0006. At that latch probe the driver trains Gen1
+#       first; the [fast] hook + push + the resident guard's staged retrains
+#       (stage interval 150ms) then complete Gen2 ~2s later;
+#     · the guard cannot help an armed-unlatched card: its gate is
+#       CAP2==0x0006, so a card with CAP2=0x0002 + declaration bits set is
+#       simply ignored until the next probe.
+#   => a factory card needs exactly TWO cycles (arm, then latch); a card that
+#      is already armed-unlatched needs ONE. The old verdict "armed-unlatched
+#      is incurable, only a reboot cures" is OVERTURNED on this machine: the
+#      2026-11-14 leftover cards were armed-unlatched simply because nothing
+#      ever re-probed them (reports/198's "incurable" claim was measured on
+#      the original machine, whose stuck state behaves differently).
+#   The proven cure, measured on this server 2026-11-15 11:26-11:30: two full
+#   cycles per card via 20-install.sh -- cycles 1-3 armed cards 04/21/27,
+#   cycles 4-6 latched them (the guard fired at the latch probe and finished
+#   Gen2 ~2s later); all 3 ended Gen2. This script reproduces exactly that
+#   flow with push.sh --force (one fresh gen2kr load + one probe per cycle):
+#
+#     pass 1: one cycle per card -- FACTORY -> arm cycle,
+#             ARMED / LATCHED -> latch cycle, DONE -> skip;
+#     pass 2: only the cards still unfinished after pass 1 -> one more cycle
+#             each (a factory card that just got armed gets its latch cycle;
+#             an armed-unlatched card that ignored its first latch cycle gets
+#             a retry; a card whose push never took gets a fresh arm cycle).
+#             Max 2 cycles per card, NO third pass: the latch is
+#             probe-triggered and deterministic, so a card that ignored both
+#             latch cycles is wedged and only a reboot cures it.
 #
 # ## What it does
 #   1. classifies every listed card from its BAR0 fingerprint (read-only peek);
-#   2. refuses unsafe states up front (stuck, dirty TLS=3, unknown, unreadable);
-#   3. pushes only factory-clean cards, ONE AT A TIME, via push.sh --force
+#   2. refuses unsafe states up front (dirty TLS=3, unknown, unreadable);
+#   3. runs pass 1, one card at a time, each cycle = push.sh --force
 #      (one fresh gen2kr load per card, exactly like a hand-run push.sh);
-#   4. after each push, watches the registers for up to ~2 minutes -- late
-#      latches are finished by the resident guard (its debounce + retrain gates);
-#   5. re-arms "latched-but-Gen1" cards (a previous push latched CAP2=0x0006 but
-#      the link never rose): fresh gen2kr + one probe, then watch;
+#   4. after each cycle, watches the registers -- pass-aware: after an arm
+#      cycle the expected state IS armed-unlatched, not an error;
+#   5. pauses ~45s (the pause also lets the guard finish latched-but-Gen1
+#      cards; pass 2 re-classifies and skips anything that reached Gen2),
+#      then runs pass 2 for the cards still unfinished;
 #   6. prints a per-card summary and leaves gen2kr resident -- the guard keeps
 #      maintaining Gen2 under load, and its CAP2==0x0006 gate covers every P104.
 #
 # ## What it never does
 #   · never rmmod/reload nvidia (the workload holds the cards; that module is
-#     patched on disk and only a reboot installs it);
-#   · never push a stuck or dirty card (the measured verdict is "reboot first");
+#     patched on disk and only a reboot installs it; gen2kr may be rmmod'ed
+#     and insmod'ed freely -- every cycle does exactly that);
+#   · never push a dirty TLS=3 card (only a cold boot recovers from TLS=3);
+#   · never hammer: at most 2 cycles per card, one push per cycle, no
+#     repeated-write loops -- the TLS=3-producing failure mode of write
+#     hammering stays out of reach;
 #   · never start a second card's push while the first is still training (the
 #     module serializes queued pushes; this script waits per card anyway).
 #
@@ -44,14 +83,36 @@
 #   Example (this server):
 #   sudo -E bash bin/push-all.sh 0000:04:00.0 0000:21:00.0 0000:27:00.0
 #
+#   The card states left behind by the 2026-11-14 version of this script
+#   (armed-unlatched, back then classified "stuck") are FINISHABLE here:
+#   they classify ARMED and pass 1's single latch cycle completes them.
+#
 # ## Per-card decision table (BAR0 fingerprint -> action)
-#   CAP2=0x0006 TLS=2 CUR=2            DONE     (skip; nothing to do)
-#   CAP2=0x0002 TLS=0|1 DECLSET=0      FACTORY  (push --force, then watch)
-#   CAP2=0x0006 TLS=2 CUR=1            LATCHED  (re-arm: fresh gen2kr + one
-#                                                 probe, then watch)
-#   CAP2=0x0002 DECLSET=1 TLS=0|1      STUCK    (refuse -> reboot first)
-#   TLS=3 (any CAP2)                   DIRTY    (refuse -> cold boot only)
-#   anything else / unreadable BAR0    UNKNOWN  (refuse -> investigate)
+#   CAP2=0x0006 TLS=2 CUR=2           DONE     (skip; nothing to do)
+#   CAP2=0x0002 TLS=0|1 DECLSET=0     FACTORY  (arm cycle, then latch cycle)
+#   CAP2=0x0006 TLS=2 CUR=1           LATCHED  (latch cycle: fresh gen2kr + one
+#                                              probe -- reports/201 measured
+#                                              push #2 on an already-latched
+#                                              card finishing clean)
+#   CAP2=0x0002 DECLSET=1 TLS=0|1|2   ARMED    (latch cycle; a second latch
+#                                              cycle follows if still
+#                                              unlatched; then NEEDS-REBOOT)
+#   TLS=3 (any CAP2)                  DIRTY    (refuse -> cold boot only)
+#   anything else / unreadable BAR0   UNKNOWN  (refuse -> investigate)
+#
+# ## Final verdicts (after both passes)
+#   DONE          link at Gen2
+#   GUARD-WORKING latched (CAP2=0x0006) but still Gen1; the resident guard
+#                 finishes it (re-check with bin/peek-regs.py)
+#   NOT-LATCHED   armed-unlatched and never latch-cycled (its cycles were
+#                 consumed by arming or the push never took) -> RE-RUN the
+#                 SAME command; one cycle will finish it
+#   NEEDS-REBOOT  armed-unlatched even after a latch cycle (wedged), or dirty
+#                 TLS=3 -> reboot (a fresh boot resets every card to the
+#                 factory state), then re-run the SAME command
+#   FAILED        registers unchanged after a cycle (the push never took) ->
+#                 re-run the SAME command
+#   UNKNOWN / REFUSED / STOPPED   investigate / refused up front / aborted
 #
 # ## Why DECLSET uses bits 11+15 (mask 0x8800) of 0x8841C
 #   The push writes bits 11 and 15 of PRIV_MISC_1; stock has neither set.
@@ -77,8 +138,11 @@ PKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PKG_ROOT/build"
 SYS_PCI="/sys/bus/pci/devices"
 NVIDIA_DRV_SYS="/sys/bus/pci/drivers/nvidia"
-MONITOR_SECONDS=120        # how long to watch a card after its push/re-arm
+MONITOR_SECONDS=120        # how long to watch a card after its cycle
 POLL_SECONDS=5
+INTERPASS_PAUSE=45         # settle time between pass 1 and pass 2
+ARM_CONFIRM=2              # consecutive ARMED reads before trusting the mid-state
+FACTORY_CONFIRM=3          # consecutive FACTORY reads before "the push never took"
 
 DRY_RUN=0
 YES=0
@@ -87,8 +151,12 @@ PLAN_CLASSES=()
 PLAN_FPS=()
 RESULTS=()
 DETAILS=()
-VERDICT=""                 # per-card outcome, set by run_card
-DETAIL=""                   # human one-liner, set by run_card
+FINALS=()
+FINAL_DETAILS=()
+LATCH_TRIED=()             # per card: 1 once a latch cycle has run
+VERDICT=""                 # per-cycle outcome, set by await_result
+DETAIL=""                  # human one-liner, set by await_result
+CUR_ACT=""                 # what run_card did: arm|latch|skip|refuse
 
 # Colors (same convention as _common.sh: off when not a tty)
 if [ -t 1 ]; then
@@ -154,9 +222,11 @@ classify() {
         return 0
     fi
     if [ "${CLS_CAP2}" = "2" ]; then
-        # The declaration was written but never latched = the reports/198 stuck
-        # state (TLS clamped back to 0/1, link Gen1). Measured cure: full reboot.
-        if [ "${CLS_DECLSET}" = "1" ]; then CLS="STUCK"
+        # The declaration was written but CAP2 never latched = armed-unlatched.
+        # NOT stuck: the latch happens at the card's NEXT probe, so one more
+        # cycle finishes this card (measured 2026-11-15, 3/3 cards). The old
+        # 2026-11-14 "incurable" verdict was an artifact of never re-probing.
+        if [ "${CLS_DECLSET}" = "1" ]; then CLS="ARMED"
         elif [ "${CLS_TLS}" -le 1 ]; then CLS="FACTORY"
         else CLS="UNKNOWN"; fi
         return 0
@@ -171,7 +241,7 @@ cls_text() {
         DONE)       echo "Gen2 (CAP2=0x0006 TLS=2 CUR=2)" ;;
         FACTORY)    echo "factory-clean (CAP2=0x0002 TLS=${CLS_TLS} decl-bits clear)" ;;
         LATCHED)    echo "latched-but-Gen1 (CAP2=0x0006 TLS=2 CUR=1)" ;;
-        STUCK)      echo "stuck/half-pushed (CAP2=0x0002 TLS=${CLS_TLS} decl-bits SET)" ;;
+        ARMED)      echo "armed-unlatched (CAP2=0x0002 TLS=${CLS_TLS} decl-bits SET; latches at the NEXT probe)" ;;
         DIRTY)      echo "dirty TLS=3 (cold boot required)" ;;
         UNREADABLE) echo "BAR0 unreadable (offline or training transient)" ;;
         *)          echo "unknown fingerprint" ;;
@@ -307,128 +377,134 @@ validate_bdfs() {
 # 4. Per-card actions
 # ============================================================
 
-# ---------- watch one card after its push/re-arm ----------
-# Sets VERDICT/DETAIL; the verdict is the contract:
+# ---------- watch one card after its cycle ----------
+# await_result <kind> <bdf>          kind = "arm" | "latch"
+#
+# Kind-aware; sets VERDICT/DETAIL. The verdict is the contract:
 #   DONE          the link reached Gen2
-#   GUARD-WORKING latched (CAP2=0x0006) but still Gen1; the resident guard
-#                 retrains every few seconds until the link rises
-#   NEEDS-REBOOT  the hardware did not latch (stuck) or the link went dirty
-#   UNKNOWN       fingerprint changed unexpectedly during the wait
+#   GUARD-WORKING latched (CAP2=0x0006) but still Gen1 at the end of the watch;
+#                 the resident guard retrains until the link rises
+#   NOT-LATCHED   armed-unlatched (CAP2=0x0002 + declaration bits set). After
+#                 an arm cycle this is the EXPECTED mid-state (the latch
+#                 happens at the card's NEXT probe -- the next pass supplies
+#                 it); after a latch cycle it means the latch was skipped or
+#                 wedged (the caller retries once, then reports NEEDS-REBOOT)
+#   NEEDS-REBOOT  the link went dirty (TLS=3) during the watch
+#   UNKNOWN       fingerprint changed unexpectedly during the watch
 #   FAILED        registers unchanged (the push never took) or unreadable
 #                 throughout the watch
 await_result() {
-    local bdf="$1" fp mrc last
+    local kind="$1" bdf="$2" fp t arm_seen=0 factory_seen=0
 
     AWAIT_DEADLINE=$(( $(date +%s) + MONITOR_SECONDS ))
-    mrc=4
-    last="?"
+    local mrc=99 last="?"
     while :; do
         fp="$(read_fp "${bdf}")"
         classify "${fp}"
         last="${CLS}"
         if [ "${CLS_CAP2}" = "6" ] && [ "${CLS_TLS}" = "2" ]; then
-            # The push latched the declaration (CAP2=0x0006, TLS=2): the resident
-            # guard owns this card from here on. CUR=2 = Gen2 (done); CUR=1 =
-            # latched-but-Gen1 (still training); CUR=0 = the LNKSTA mirror reads
-            # 0 for ~100ms during the guard's retrain -- same "keep watching".
+            # Latched: the resident guard owns this card from here on.
+            # CUR=2 = Gen2 (done); CUR=1 = still training; CUR=0 = the LNKSTA
+            # mirror reads 0 for ~100ms during the guard's retrain -- same
+            # "keep watching".
             if [ "${CLS_CUR}" = "2" ]; then mrc=0; break; fi
             last="LATCHED"
         else
             case "${CLS}" in
-                STUCK|DIRTY)
-                    mrc=2; break ;;
+                ARMED)
+                    # armed-unlatched: the latch happens at the NEXT probe,
+                    # never during this cycle's own retrain
+                    if [ "${kind}" = "arm" ]; then
+                        arm_seen=$((arm_seen + 1))
+                        [ "${arm_seen}" -ge "${ARM_CONFIRM}" ] && { mrc=5; break; }
+                    else
+                        mrc=5; break   # latch cycle: break early; caller retries/finalizes
+                    fi ;;
+                DIRTY) mrc=2; break ;;
                 FACTORY)
-                    mrc=4; break ;;                       # registers unchanged: the push never took
-                UNREADABLE) ;;                            # a retrain transient; keep watching
-                *)
-                    mrc=3; break ;;                       # genuinely unknown fingerprint
+                    # declaration bits gone again = the push never took
+                    factory_seen=$((factory_seen + 1))
+                    [ "${factory_seen}" -ge "${FACTORY_CONFIRM}" ] && { mrc=4; break; }
+                    ;;
+                UNREADABLE) ;;               # a retrain transient; keep watching
+                *)     mrc=3; break ;;       # genuinely unknown fingerprint
             esac
         fi
-        local t
         t="$(date +%s)"
-        if [ "${t}" -ge "${AWAIT_DEADLINE}" ]; then
-            # Timed out: only a card we saw latched counts as guard-work;
-            # everything else is "never took".
-            [ "${last}" = "LATCHED" ] && mrc=1
-            break
-        fi
+        [ "${t}" -ge "${AWAIT_DEADLINE}" ] && break
         sleep "${POLL_SECONDS}"
     done
 
+    if [ "${mrc}" = "99" ]; then         # timed out without a decisive read
+        if [ "${last}" = "LATCHED" ]; then mrc=1
+        elif [ "${arm_seen}" -gt 0 ]; then mrc=5
+        else                               mrc=4
+        fi
+    fi
+
     case "${mrc}" in
-        0) VERDICT="DONE";           DETAIL="link reached Gen2" ;;
-        1) VERDICT="GUARD-WORKING";  DETAIL="latched (CAP2=0x0006) but still Gen1; the resident guard keeps training" ;;
-        2) VERDICT="NEEDS-REBOOT";   DETAIL="hardware did not latch the declaration (reports/198 stuck state)" ;;
-        3) VERDICT="UNKNOWN";        DETAIL="fingerprint changed unexpectedly during the wait" ;;
-        *) VERDICT="FAILED";         DETAIL="registers unchanged after the push (or unreadable throughout the watch)" ;;
+        0) VERDICT="DONE";          DETAIL="link reached Gen2" ;;
+        1) VERDICT="GUARD-WORKING"; DETAIL="latched (CAP2=0x0006) but still Gen1 after ${MONITOR_SECONDS}s; the resident guard keeps training" ;;
+        2) VERDICT="NEEDS-REBOOT";  DETAIL="link went dirty (TLS=3) during the watch" ;;
+        3) VERDICT="UNKNOWN";       DETAIL="fingerprint changed unexpectedly during the watch" ;;
+        4) VERDICT="FAILED";        DETAIL="registers unchanged after the cycle (the push never took), or unreadable throughout the watch" ;;
+        *) VERDICT="NOT-LATCHED";   DETAIL="armed-unlatched (CAP2=0x0002 + decl-bits set): CAP2 latches at the NEXT probe, not during this cycle" ;;
     esac
 }
 AWAIT_DEADLINE=0    # set inside await_result
 
-# ---------- push one factory-clean card via push.sh ----------
-do_push() {
-    local bdf="$1" rc
+# ---------- run one push.sh cycle on one card ----------
+# do_cycle <bdf> <kind>          kind = "arm" | "latch" (only affects the watch)
+#
+# One cycle = exactly the proven 20-install.sh per-card flow:
+#   rmmod gen2kr + insmod gen2kr + one nv_pci_probe (unbind/bind) + wait,
+#   which is what push.sh --force does; the kretprobe fires at the probe and
+#   gen2kr pushes the card there.
+do_cycle() {
+    local bdf="$1" kind="$2" rc
 
-    hdr "Pushing ${bdf} (push.sh --force; one fresh gen2kr load per card)"
+    if [ "${kind}" = "arm" ]; then
+        hdr "Arming ${bdf} (cycle 1 of 2 for a factory card: push.sh --force)"
+    else
+        hdr "Latch cycle for ${bdf} (push.sh --force; CAP2 latches at THIS probe)"
+    fi
 
-    # ★ push.sh's own pre-check refuses this server's fresh-boot state: on the
-    #   ORIGINAL machine "clean" means CAP2=0x0002 + TLS=1, but the patched
-    #   driver never writes the Gen1 declaration at boot, so here the factory
-    #   state boots with TLS=0. --force is therefore REQUIRED -- but it is
-    #   never blind: the classifier above verified the full factory fingerprint
-    #   (CAP2=0x0002 + TLS<=1 + decl-bits clear) immediately before this call.
+    # ★ --force is REQUIRED but never blind: push.sh's own pre-check refuses
+    #   this server's fresh-boot state (on the ORIGINAL machine "clean" means
+    #   CAP2=0x0002 + TLS=1, but the patched driver never writes the Gen1
+    #   declaration at boot, so here the factory state boots with TLS=0) and
+    #   refuses armed/latched cards as "dirty". The classifier verified the
+    #   full fingerprint immediately before this call, so --force only skips a
+    #   check this script already made itself.
+    #   (push.sh's rc=2 advice -- "CAP2 stays pinned => reboot, do not keep
+    #   retrying" -- is generic; the pass structure of THIS script replaces
+    #   it: an arm cycle is SUPPOSED to leave the link at Gen1.)
     TARGET_BDF="${bdf}" bash "${PKG_ROOT}/bin/push.sh" --force
     rc=$?
     case "${rc}" in
         0) ;;   # push.sh's own wait saw Gen2 -- verified again below anyway
-        1) VERDICT="STOPPED"; DETAIL="push.sh refused at the pre-check; nothing was written"; return 0 ;;
-        2) warn "push.sh's 20s wait timed out; watching the registers a bit longer" ;;
+        1) VERDICT="STOPPED"; DETAIL="push.sh refused at its pre-check; nothing was written"; return 0 ;;
+        2) ;;   # the link stayed Gen1: EXPECTED for an arm cycle, and possible
+                # for a latch cycle whose guard retrains outlast push.sh's 20s
+                # wait -- await_result decides
         *) VERDICT="STOPPED"; DETAIL="push.sh exited ${rc}"; return 0 ;;
     esac
 
-    await_result "${bdf}"
-}
-
-# ---------- re-arm one latched-but-Gen1 card ----------
-do_rearm() {
-    local bdf="$1"
-
-    hdr "Re-arming ${bdf} (fresh gen2kr + one probe)"
-
-    # Why a probe is mandatory: gen2kr only starts its guard from push_fn --
-    # INIT_DELAYED_WORK at insmod never schedules the guard work, so a bare
-    # insmod would attach the kretprobe and then just sit there. One probe =
-    # one queued push of THIS card, measured safe on an already-latched card
-    # (reports/201: push #2 started at cap2=00000006 and finished clean).
-    if lsmod | grep -q '^gen2kr'; then
-        rmmod gen2kr 2>/dev/null || { err "rmmod gen2kr failed"; VERDICT="STOPPED"; DETAIL="rmmod gen2kr failed"; return 0; }
-        echo "   old gen2kr unloaded (the guard rebuilds its per-device state at insmod)"
-    fi
-    if ! insmod "${BUILD_DIR}/gen2kr.ko"; then
-        err "insmod failed"; VERDICT="STOPPED"; DETAIL="insmod failed"; return 0
-    fi
-    echo "   loaded ${BUILD_DIR}/gen2kr.ko"
-    sleep 1
-
-    check_idle || { VERDICT="STOPPED"; DETAIL="a workload started holding /dev/nvidia*"; return 0; }
-    echo "   unbind ..."
-    if ! echo "${bdf}" > "${NVIDIA_DRV_SYS}/unbind"; then
-        err "unbind failed"; VERDICT="STOPPED"; DETAIL="unbind write failed"; return 0
-    fi
-    sleep 1
-    echo "   bind   ..."
-    if ! echo "${bdf}" > "${NVIDIA_DRV_SYS}/bind"; then
-        err "bind failed"; VERDICT="STOPPED"; DETAIL="bind write failed"; return 0
-    fi
-
-    await_result "${bdf}"
+    await_result "${kind}" "${bdf}"
 }
 
 # ---------- classify + act on one card ----------
-run_card() {   # $1 = BDF, $2 = planned class
+# run_card <bdf> <planned>       planned = "" suppresses the change warning
+#
+# The ACTION follows the CURRENT class, not the plan -- that is what makes
+# both passes safe: in pass 2 a card armed by pass 1 is ARMED and gets its
+# latch cycle; a card whose push never took is still FACTORY and gets a fresh
+# arm cycle. Sets CUR_ACT so the caller can record whether this card has had
+# a latch cycle.
+run_card() {
     local bdf="$1" planned="$2" fp
 
-    VERDICT=""; DETAIL=""
+    VERDICT=""; DETAIL=""; CUR_ACT=""
 
     if ! check_idle; then
         VERDICT="STOPPED"; DETAIL="a workload is holding /dev/nvidia*"
@@ -436,30 +512,35 @@ run_card() {   # $1 = BDF, $2 = planned class
     fi
 
     # Re-classify right before acting: the plan may be minutes old, and a
-    # stale fingerprint could send the push to the wrong state.
+    # stale fingerprint could send the cycle to the wrong state.
     fp="$(read_fp "${bdf}")"
     classify "${fp}"
-    if [ "${CLS}" != "${planned}" ]; then
+    if [ -n "${planned}" ] && [ "${CLS}" != "${planned}" ]; then
         warn "${bdf}: state changed since the plan (${planned} -> ${CLS}); acting on the current state"
-        if [ "${CLS}" = "UNREADABLE" ] || [ "${CLS}" = "UNKNOWN" ]; then
-            VERDICT="REFUSED"; DETAIL="current fingerprint unreadable/unknown: $(fp_text)"
-            return 0
-        fi
     fi
+    case "${CLS}" in
+        UNREADABLE|UNKNOWN)
+            CUR_ACT="refuse"
+            VERDICT="REFUSED"; DETAIL="current fingerprint unreadable/unknown: $(fp_text)"
+            return 0 ;;
+    esac
 
     case "${CLS}" in
         DONE)
+            CUR_ACT="skip"
             VERDICT="DONE"; DETAIL="already Gen2 (nothing to do)" ;;
         FACTORY)
-            do_push "${bdf}" ;;
-        LATCHED)
-            do_rearm "${bdf}" ;;
-        STUCK)
-            VERDICT="NEEDS-REBOOT"
-            DETAIL="refused: half-pushed state (declaration written, CAP2 not latched, TLS=${CLS_TLS})" ;;
+            CUR_ACT="arm"
+            do_cycle "${bdf}" arm ;;
+        ARMED|LATCHED)
+            CUR_ACT="latch"
+            do_cycle "${bdf}" latch ;;
         DIRTY)
-            VERDICT="NEEDS-REBOOT"; DETAIL="refused: TLS=3 dirty link state (cold boot required)" ;;
+            CUR_ACT="refuse"
+            VERDICT="NEEDS-REBOOT"
+            DETAIL="refused: TLS=3 dirty link state (cold boot required)" ;;
         *)
+            CUR_ACT="refuse"
             VERDICT="REFUSED"; DETAIL="unknown fingerprint: $(fp_text)" ;;
     esac
 }
@@ -470,41 +551,48 @@ run_card() {   # $1 = BDF, $2 = planned class
 plan_action() {   # $1 = class -> human action
     case "$1" in
         DONE)    echo "skip (already Gen2)" ;;
-        FACTORY) echo "push --force, then watch up to ${MONITOR_SECONDS}s" ;;
-        LATCHED) echo "re-arm (fresh gen2kr + one probe), then watch up to ${MONITOR_SECONDS}s" ;;
-        STUCK)   echo "REFUSED (reports/198: only a full reboot cures)" ;;
+        FACTORY) echo "arm cycle, then latch cycle (2 cycles, one per pass)" ;;
+        ARMED)   echo "latch cycle (a retry cycle follows if still unlatched; then reboot)" ;;
+        LATCHED) echo "latch cycle (fresh gen2kr + one probe; reports/201 measured this safe)" ;;
         DIRTY)   echo "REFUSED (TLS=3; cold boot only)" ;;
         *)       echo "REFUSED (investigate first)" ;;
     esac
 }
 
 summary() {
-    local i=0 done_cnt=0 bad_cnt=0 r
+    local i done_cnt=0 rerun_cnt=0 reboot_cnt=0 guard_cnt=0 f
 
     hdr "Summary"
-    for b in "${BDFS[@]}"; do
-        printf '  %-14s %-13s %s\n' "${b}" "${RESULTS[i]:-not-run}" "${DETAILS[i]:-}"
-        i=$((i+1))
-    done
-
-    for r in "${RESULTS[@]}"; do
-        case "${r}" in
-            DONE) done_cnt=$((done_cnt + 1)) ;;
-            *)    bad_cnt=$((bad_cnt + 1)) ;;
+    for ((i=0; i<${#BDFS[@]}; i++)); do
+        printf '  %-14s %-13s %s\n' "${BDFS[i]}" "${FINALS[i]:-NOT-RUN}" "${FINAL_DETAILS[i]:-}"
+        case "${FINALS[i]:-}" in
+            DONE)               done_cnt=$((done_cnt + 1)) ;;
+            NOT-LATCHED|FAILED) rerun_cnt=$((rerun_cnt + 1)) ;;
+            NEEDS-REBOOT)       reboot_cnt=$((reboot_cnt + 1)) ;;
+            GUARD-WORKING)      guard_cnt=$((guard_cnt + 1)) ;;
         esac
     done
 
     if [ "${done_cnt}" -gt 0 ]; then
         ok "${done_cnt} card(s) at Gen2 -- verify bandwidth: build/bwtest2 512 15 | grep pinned   (~1.56 / 1.71 GB/s)"
     fi
+    if [ "${guard_cnt}" -gt 0 ]; then
+        warn "${guard_cnt} card(s) latched but still training -- the resident guard finishes them;"
+        echo "     re-check in a minute:  DEV_BDF=<bdf> python3 bin/peek-regs.py   (CAP2 should be 0x00000006)"
+    fi
     if lsmod | grep -q '^gen2kr'; then
         ok "gen2kr stays resident; its guard maintains Gen2 under load (the CAP2==0x0006 gate covers every P104)"
     fi
-    if [ "${bad_cnt}" -gt 0 ]; then
-        warn "${bad_cnt} card(s) did not reach Gen2 -- the measured cure is a full reboot:"
-        echo "     a fresh boot resets every card to the factory state (measured 2026-11-15 07:11"
-        echo "     on this server), so after rebooting re-run the SAME command -- it will then"
-        echo "     push every listed card from the clean starting point, one at a time."
+    if [ "${rerun_cnt}" -gt 0 ]; then
+        warn "${rerun_cnt} card(s) still need one more cycle -- re-run the SAME command:"
+        echo "     an armed-unlatched card is finished by ONE latch cycle (the latch happens"
+        echo "     at the card's next probe); a card whose push never took gets 2 fresh cycles."
+    fi
+    if [ "${reboot_cnt}" -gt 0 ]; then
+        warn "${reboot_cnt} card(s) need a full reboot -- a fresh boot resets every card to the"
+        echo "     factory state (measured 2026-11-15 07:11 on this server), so after rebooting"
+        echo "     re-run the SAME command -- it will then push every listed card from the clean"
+        echo "     starting point, one at a time."
     fi
 }
 
@@ -541,13 +629,13 @@ main() {
     local n_to_write=0 cls
     for cls in "${PLAN_CLASSES[@]}"; do
         case "${cls}" in
-            FACTORY|LATCHED) n_to_write=$((n_to_write + 1)) ;;
+            FACTORY|ARMED|LATCHED) n_to_write=$((n_to_write + 1)) ;;
         esac
     done
 
     if [ "${n_to_write}" = "0" ]; then
         # Nothing pushable: every listed card is DONE, refused, or unreadable.
-        local rc=0 cls
+        local rc=0
         for cls in "${PLAN_CLASSES[@]}"; do
             case "${cls}" in
                 DONE) ;;
@@ -571,7 +659,8 @@ main() {
         printf '  %-14s %s -> %s\n' "${b}" "${PLAN_CLASSES[i]}" "$(plan_action "${PLAN_CLASSES[i]}")"
         i=$((i + 1))
     done
-    echo "  ${n_to_write} card(s) will be written; the rest are skipped or refused."
+    echo "  ${n_to_write} card(s) will be written in pass 1; the rest are skipped or refused."
+    echo "  A card still unfinished after pass 1 gets ONE more cycle in pass 2 (max 2 per card)."
     echo "  This must run in an IDLE window: no process may hold /dev/nvidia*"
     echo "  (unbind under load wedges the kernel; only a reboot cures it)."
     if ! check_idle; then
@@ -587,31 +676,100 @@ main() {
         *) echo "aborted by the user"; exit 130 ;;
     esac
 
-    # ---------- execute, one card at a time ----------
-    hdr "Executing"
-    i=0
-    for b in "${BDFS[@]}"; do
-        RESULTS[i]="NOT-RUN"; DETAILS[i]=""
+    # ---------- pass 1: one cycle per card ----------
+    hdr "Pass 1 -- one cycle per card"
+    local stopped=0
+    for ((i=0; i<${#BDFS[@]}; i++)); do
+        RESULTS[i]="NOT-RUN"; DETAILS[i]=""; LATCH_TRIED[i]=0
+        FINALS[i]="NOT-RUN"; FINAL_DETAILS[i]=""
+    done
+    for ((i=0; i<${#BDFS[@]}; i++)); do
+        b="${BDFS[i]}"
         run_card "${b}" "${PLAN_CLASSES[i]}"
+        [ "${CUR_ACT}" = "latch" ] && LATCH_TRIED[i]=1
         RESULTS[i]="${VERDICT}"; DETAILS[i]="${DETAIL}"
+        printf '  %-14s %s -- %s\n' "${b}" "${VERDICT}" "${DETAIL}"
         case "${VERDICT}" in
             STOPPED)
                 err "stopping before the next card (conditions changed under our feet)"
+                stopped=1
                 break ;;
         esac
-        i=$((i + 1))
+    done
+
+    # ---------- pass 2: only the cards still unfinished after pass 1 ----------
+    local n2=0
+    if [ "${stopped}" = "0" ]; then
+        for ((i=0; i<${#BDFS[@]}; i++)); do
+            case "${RESULTS[i]}" in
+                NOT-LATCHED|FAILED|GUARD-WORKING) n2=$((n2 + 1)) ;;
+            esac
+        done
+    fi
+
+    if [ "${n2}" -gt 0 ] && [ "${stopped}" = "0" ]; then
+        echo
+        echo "  pass 1 left ${n2} card(s) unfinished; settling ${INTERPASS_PAUSE}s"
+        echo "  (the pause also gives the guard time to finish latched-but-Gen1 cards;"
+        echo "   pass 2 re-classifies and skips anything that reached Gen2 meanwhile)"
+        sleep "${INTERPASS_PAUSE}"
+
+        hdr "Pass 2 -- one more cycle per unfinished card"
+        for ((i=0; i<${#BDFS[@]}; i++)); do
+            case "${RESULTS[i]}" in
+                NOT-LATCHED|FAILED|GUARD-WORKING) ;;
+                *) continue ;;
+            esac
+            b="${BDFS[i]}"
+            run_card "${b}" ""
+            [ "${CUR_ACT}" = "latch" ] && LATCH_TRIED[i]=1
+            RESULTS[i]="${VERDICT}"; DETAILS[i]="${DETAIL}"
+            printf '  %-14s %s -- %s\n' "${b}" "${VERDICT}" "${DETAIL}"
+            case "${VERDICT}" in
+                STOPPED)
+                    err "stopping (conditions changed under our feet)"
+                    stopped=1
+                    break ;;
+            esac
+        done
+    fi
+
+    # ---------- final verdicts ----------
+    hdr "Final verdicts"
+    for ((i=0; i<${#BDFS[@]}; i++)); do
+        case "${RESULTS[i]}" in
+            DONE)
+                FINALS[i]="DONE"; FINAL_DETAILS[i]="${DETAILS[i]}" ;;
+            GUARD-WORKING)
+                FINALS[i]="GUARD-WORKING"; FINAL_DETAILS[i]="${DETAILS[i]}" ;;
+            NOT-LATCHED)
+                if [ "${LATCH_TRIED[i]}" = "1" ]; then
+                    FINALS[i]="NEEDS-REBOOT"
+                    FINAL_DETAILS[i]="armed-unlatched even after a latch cycle -- wedged; reboot, then re-run"
+                else
+                    FINALS[i]="NOT-LATCHED"
+                    FINAL_DETAILS[i]="armed (declaration written), never latch-cycled -- re-run the SAME command"
+                fi ;;
+            FAILED)
+                FINALS[i]="FAILED"
+                FINAL_DETAILS[i]="the push never took (registers unchanged) -- re-run the SAME command" ;;
+            NEEDS-REBOOT|UNKNOWN|REFUSED|STOPPED)
+                FINALS[i]="${RESULTS[i]}"; FINAL_DETAILS[i]="${DETAILS[i]}" ;;
+            *)
+                FINALS[i]="NOT-RUN"; FINAL_DETAILS[i]="" ;;
+        esac
     done
 
     summary
-    local rc=0 stop=0 r
-    for r in "${RESULTS[@]}"; do
-        [ "${r}" = "STOPPED" ] && stop=1
-        case "${r}" in
+
+    local rc=0 f
+    for f in "${FINALS[@]}"; do
+        case "${f}" in
             DONE) ;;
-            *) rc=2 ;;
+            *)    rc=2 ;;
         esac
     done
-    [ "${stop}" = "1" ] && rc=3
+    [ "${stopped}" = "1" ] && rc=3
     exit "${rc}"
 }
 
